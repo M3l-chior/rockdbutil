@@ -214,7 +214,7 @@ get_optimal_buffer_size() {
 	fi
 
 	local available_gb=$(free -g | awk '/^Mem:/{print $7}')
-	local safe_max_gb=$((available_gb - 2))
+	local safe_max_gb=$((available_gb - 1))
 
 	if [[ $suggested_buffer_gb -gt $safe_max_gb ]]; then
 		suggested_buffer_gb=$safe_max_gb
@@ -229,6 +229,12 @@ get_optimal_buffer_size() {
 
 apply_temporary_buffer_optimization() {
 	local target_buffer_gb="$1"
+
+	if ! sudo -n true 2>/dev/null; then
+		log_info "Requesting sudo access for buffer pool optimization.."
+		sudo -v
+	fi
+
 	local mysql_cmd=$(get_mysql_command)
 
     local current_buffer_gb=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -e "SELECT ROUND(@@innodb_buffer_pool_size/1024/1024/1024, 2);" 2>/dev/null | tail -n +2)
@@ -349,7 +355,7 @@ export_database() {
 			fi
 		fi
 	done
-# /bin/	
+
 	log_success "Successfully exported $exported/$table_count tables"
 	
 	log_step "Creating compressed archive..."
@@ -383,6 +389,9 @@ export_database() {
 import_database() {
 	local archive_file="$1"
 	local auto_cleanup="$2"
+
+	local cleanup_buffer=false
+	trap 'if [[ "${cleanup_buffer:-false}" == "true" ]]; then restore_original_buffer_config; fi' EXIT
 	
 	if [[ -z "$archive_file" ]]; then
 		log_error "Archive file not specified"
@@ -405,15 +414,29 @@ import_database() {
 	local suggested_buffer_gb=$(echo "$buffer_info" | cut -d: -f2) 
 	local total_ram_gb=$(echo "$buffer_info" | cut -d: -f3)
 
+	local mysql_cmd=$(get_mysql_command)
+	
+	# Detailed system info
+	echo -e "${WHITE}System Memory Status:${NC}"
+	echo "Total RAM: ${total_ram_gb}GB"
+	echo "Available: $(free -h | awk '/^Mem:/{print $7}')"
+	echo "Current Buffer Pool: ${current_buffer_gb}GB"
+	
 	local use_buffer_optimization=false
 	local available_gb=$(free -g | awk '/^Mem:/{print $7}')
 	local safe_max_gb=$((available_gb - 2))
 	local original_suggested=$((total_ram_gb * 70 / 100))
 
 	if [[ $original_suggested -gt $safe_max_gb ]]; then
-		log_info "System RAM: ${total_ram_gb}GB, Current buffer: ${current_buffer_gb}GB, Suggested: ${suggested_buffer_gb}GB (reduced from ${original_suggested}GB for safety)"
+		log_info "Optimization available: ${suggested_buffer_gb}GB (reduced from ${original_suggested}GB for safety)"
 	else
-		log_info "System RAM: ${total_ram_gb}GB, Current buffer: ${current_buffer_gb}GB, Suggested: ${suggested_buffer_gb}GB"
+		log_info "Optimization available: ${suggested_buffer_gb}GB"
+	fi
+
+	if [[ $(echo "$suggested_buffer_gb > $current_buffer_gb" | bc 2>/dev/null) == "1" ]]; then
+		log_info "Will use: ${suggested_buffer_gb}GB (optimized)"
+	else
+		log_info "Will use: ${current_buffer_gb}GB (current is already optimal)"
 	fi
 
 	if [[ $(echo "$suggested_buffer_gb > $current_buffer_gb" | bc 2>/dev/null) == "1" ]]; then
@@ -423,6 +446,7 @@ import_database() {
 			# Auto mode
 			if apply_temporary_buffer_optimization "$suggested_buffer_gb"; then
 				use_buffer_optimization=true
+				cleanup_buffer=true
 			fi
 		else
 			# Interactive mode
@@ -431,6 +455,7 @@ import_database() {
 			if [[ ! $REPLY =~ ^[Nn]$ ]]; then
 				if apply_temporary_buffer_optimization "$suggested_buffer_gb"; then
 					use_buffer_optimization=true
+					cleanup_buffer=true
 				fi
 			fi
 		fi
@@ -516,9 +541,11 @@ import_database() {
 	export -f import_single_file
 	export DB_USER DB_PASS DB_NAME ERROR_LOG_DIR ERROR_REPORT SUCCESS_LOG
 
+	local import_success=false
 	if parallel -j "$threads" import_single_file {} "$mysql_cmd" ::: "$EXTRACT_DIR"/*.sql; then
 		local success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
 		log_success "All $success_count SQL files imported successfully"
+		import_success=true
 	else
 		local success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
 		local total_files=$(find "$EXTRACT_DIR" -name "*.sql" | wc -l)
@@ -527,7 +554,13 @@ import_database() {
 		log_warning "$failed_count out of $total_files imports failed during parallel phase"
 		log_info "Will retry failed imports sequentially.."
 		
-		retry_failed_imports "$mysql_cmd"
+		if retry_failed_imports "$mysql_cmd"; then
+			log_success "Failed imports successfully retried"
+			import_success=true
+		else
+			log_error "Some imports still failed after retry attempts"
+			import_success=false
+		fi
 	fi
 	
 	if [[ "$auto_cleanup" == "true" ]]; then
@@ -537,7 +570,17 @@ import_database() {
 		log_success "Temporary files automatically cleaned up"
 	fi
 	
-	log_success "Database import completed successfully!"
+	if [[ "$use_buffer_optimization" == "true" ]]; then
+		sudo -v 2>/dev/null || sudo -v
+		restore_original_buffer_config
+	fi
+	
+	if [[ "$import_success" == "true" ]]; then
+		log_success "Database import completed successfully!"
+	else
+		log_error "Database import completed with errors!"
+		exit 1
+	fi
 }
 
 # Temporarily increase buffer pool (session only)
