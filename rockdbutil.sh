@@ -186,6 +186,116 @@ get_thread_count() {
 	echo "$threads"
 }
 
+get_optimal_buffer_size() {
+	local total_ram_gb=$(free -g | awk '/^Mem:/{print $2}')
+	local current_buffer_gb=$($(get_mysql_command) -u "$DB_USER" -p"$DB_PASS" -e "SELECT ROUND(@@innodb_buffer_pool_size/1024/1024/1024, 2);" 2>/dev/null | tail -n +2)
+
+	# Aggressive import-optimized sizing (temporary during import)
+	local suggested_buffer_gb
+
+	if [[ $total_ram_gb -ge 64 ]]; then
+		# 64GB+ systems: ~50% (32GB+)
+		suggested_buffer_gb=$((total_ram_gb * 50 / 100))
+	elif [[ $total_ram_gb -ge 32 ]]; then
+		# 32-63GB systems: ~60% (19-38GB)
+		suggested_buffer_gb=$((total_ram_gb * 60 / 100))
+	elif [[ $total_ram_gb -ge 16 ]]; then
+		# 16-31GB systems: ~65% (10-20GB)
+		suggested_buffer_gb=$((total_ram_gb * 65 / 100))
+	elif [[ $total_ram_gb -ge 8 ]]; then
+		# 8-15GB systems: ~70% (5-10GB)
+		suggested_buffer_gb=$((total_ram_gb * 70 / 100))
+	elif [[ $total_ram_gb -ge 4 ]]; then
+		# 4-7GB systems: ~75% (3-5GB)
+		suggested_buffer_gb=$((total_ram_gb * 75 / 100))
+	else
+		# <4GB systems: 1GB
+		suggested_buffer_gb=1
+	fi
+
+	local available_gb=$(free -g | awk '/^Mem:/{print $7}')
+	local safe_max_gb=$((available_gb - 1))
+
+	if [[ $suggested_buffer_gb -gt $safe_max_gb ]]; then
+		suggested_buffer_gb=$safe_max_gb
+	fi
+
+	if [[ $suggested_buffer_gb -lt 1 ]]; then
+		suggested_buffer_gb=1
+	fi
+	
+	echo "$current_buffer_gb:$suggested_buffer_gb:$total_ram_gb"
+}
+
+apply_temporary_buffer_optimization() {
+	local target_buffer_gb="$1"
+
+	if ! sudo -n true 2>/dev/null; then
+		log_info "Requesting sudo access for buffer pool optimization.."
+		sudo -v
+	fi
+
+	local mysql_cmd=$(get_mysql_command)
+
+    local current_buffer_gb=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -e "SELECT ROUND(@@innodb_buffer_pool_size/1024/1024/1024, 2);" 2>/dev/null | tail -n +2)
+    
+    if (( $(echo "$target_buffer_gb > $current_buffer_gb" | bc -l 2>/dev/null || echo "0") )); then
+        log_info "Temporarily increasing buffer pool from ${current_buffer_gb}GB to ${target_buffer_gb}GB for import"
+        
+        local config_file=""
+        local possible_configs=(
+            "/etc/mysql/mariadb.conf.d/50-server.cnf"
+            "/etc/mysql/mysql.conf.d/mysqld.cnf" 
+            "/etc/mysql/my.cnf"
+            "/etc/my.cnf"
+        )
+        
+        for config in "${possible_configs[@]}"; do
+            if [[ -f "$config" ]]; then
+                config_file="$config"
+                break
+            fi
+        done
+        
+        if [[ -n "$config_file" ]]; then
+            local backup_file="${config_file}.temp_import.$(date +%Y%m%d_%H%M%S)"
+            sudo cp "$config_file" "$backup_file"
+            
+            sudo sed -i '/^innodb_buffer_pool_size/d' "$config_file"
+            if grep -q "^\[mysqld\]" "$config_file"; then
+                sudo sed -i '/^\[mysqld\]/a innodb_buffer_pool_size = '"${target_buffer_gb}G" "$config_file"
+            else
+                echo -e "\n[mysqld]\ninnodb_buffer_pool_size = ${target_buffer_gb}G" | sudo tee -a "$config_file" >/dev/null
+            fi
+            
+            log_info "Restarting MariaDB with optimized buffer pool..."
+            sudo systemctl restart mariadb
+            sleep 3
+            
+            echo "$backup_file" > "$BASE_DIR/temp_config_backup"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+restore_original_buffer_config() {
+    local backup_file_location="$BASE_DIR/temp_config_backup"
+    
+    if [[ -f "$backup_file_location" ]]; then
+        local backup_file=$(cat "$backup_file_location")
+        if [[ -f "$backup_file" ]]; then
+            log_info "Restoring original buffer pool configuration..."
+            sudo cp "$backup_file" "${backup_file%.temp_import.*}"
+            sudo systemctl restart mariadb
+            sleep 3
+            sudo rm -f "$backup_file" "$backup_file_location"
+            log_success "Original configuration restored"
+        fi
+    fi
+}
+
 setup_directories() {
 	if [[ ! -d "$BASE_DIR" ]]; then
 		mkdir -p "$BASE_DIR"
@@ -245,7 +355,7 @@ export_database() {
 			fi
 		fi
 	done
-	
+
 	log_success "Successfully exported $exported/$table_count tables"
 	
 	log_step "Creating compressed archive..."
@@ -279,6 +389,9 @@ export_database() {
 import_database() {
 	local archive_file="$1"
 	local auto_cleanup="$2"
+
+	local cleanup_buffer=false
+	trap 'if [[ "${cleanup_buffer:-false}" == "true" ]]; then restore_original_buffer_config; fi' EXIT
 	
 	if [[ -z "$archive_file" ]]; then
 		log_error "Archive file not specified"
@@ -295,6 +408,58 @@ import_database() {
 	
 	check_command "parallel"
 	test_db_connection
+
+	local buffer_info=$(get_optimal_buffer_size)
+	local current_buffer_gb=$(echo "$buffer_info" | cut -d: -f1)
+	local suggested_buffer_gb=$(echo "$buffer_info" | cut -d: -f2) 
+	local total_ram_gb=$(echo "$buffer_info" | cut -d: -f3)
+
+	local mysql_cmd=$(get_mysql_command)
+	
+	# Detailed system info
+	echo -e "${WHITE}System Memory Status:${NC}"
+	echo "Total RAM: ${total_ram_gb}GB"
+	echo "Available: $(free -h | awk '/^Mem:/{print $7}')"
+	echo "Current Buffer Pool: ${current_buffer_gb}GB"
+	
+	local use_buffer_optimization=false
+	local available_gb=$(free -g | awk '/^Mem:/{print $7}')
+	local safe_max_gb=$((available_gb - 2))
+	local original_suggested=$((total_ram_gb * 70 / 100))
+
+	if [[ $original_suggested -gt $safe_max_gb ]]; then
+		log_info "Optimization available: ${suggested_buffer_gb}GB (reduced from ${original_suggested}GB for safety)"
+	else
+		log_info "Optimization available: ${suggested_buffer_gb}GB"
+	fi
+
+	if [[ $(echo "$suggested_buffer_gb > $current_buffer_gb" | bc 2>/dev/null) == "1" ]]; then
+		log_info "Will use: ${suggested_buffer_gb}GB (optimized)"
+	else
+		log_info "Will use: ${current_buffer_gb}GB (current is already optimal)"
+	fi
+
+	if [[ $(echo "$suggested_buffer_gb > $current_buffer_gb" | bc 2>/dev/null) == "1" ]]; then
+		log_info "Buffer optimization will be applied: ${current_buffer_gb}GB → ${suggested_buffer_gb}GB"
+		
+		if [[ "$auto_cleanup" == "true" ]]; then
+			# Auto mode
+			if apply_temporary_buffer_optimization "$suggested_buffer_gb"; then
+				use_buffer_optimization=true
+				cleanup_buffer=true
+			fi
+		else
+			# Interactive mode
+			read -p "$(echo -e "${YELLOW}Temporarily increase buffer pool to ${suggested_buffer_gb}GB for faster import? [Y/n]:${NC} ")" -n 1 -r
+			echo
+			if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+				if apply_temporary_buffer_optimization "$suggested_buffer_gb"; then
+					use_buffer_optimization=true
+					cleanup_buffer=true
+				fi
+			fi
+		fi
+	fi
 	
 	local mysql_cmd=$(get_mysql_command)
 	local threads=$(get_thread_count)
@@ -376,9 +541,11 @@ import_database() {
 	export -f import_single_file
 	export DB_USER DB_PASS DB_NAME ERROR_LOG_DIR ERROR_REPORT SUCCESS_LOG
 
+	local import_success=false
 	if parallel -j "$threads" import_single_file {} "$mysql_cmd" ::: "$EXTRACT_DIR"/*.sql; then
 		local success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
 		log_success "All $success_count SQL files imported successfully"
+		import_success=true
 	else
 		local success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
 		local total_files=$(find "$EXTRACT_DIR" -name "*.sql" | wc -l)
@@ -387,7 +554,13 @@ import_database() {
 		log_warning "$failed_count out of $total_files imports failed during parallel phase"
 		log_info "Will retry failed imports sequentially.."
 		
-		retry_failed_imports "$mysql_cmd"
+		if retry_failed_imports "$mysql_cmd"; then
+			log_success "Failed imports successfully retried"
+			import_success=true
+		else
+			log_error "Some imports still failed after retry attempts"
+			import_success=false
+		fi
 	fi
 	
 	if [[ "$auto_cleanup" == "true" ]]; then
@@ -397,14 +570,24 @@ import_database() {
 		log_success "Temporary files automatically cleaned up"
 	fi
 	
-	log_success "Database import completed successfully!"
+	if [[ "$use_buffer_optimization" == "true" ]]; then
+		sudo -v 2>/dev/null || sudo -v
+		restore_original_buffer_config
+	fi
+	
+	if [[ "$import_success" == "true" ]]; then
+		log_success "Database import completed successfully!"
+	else
+		log_error "Database import completed with errors!"
+		exit 1
+	fi
 }
 
-# Function to temporarily increase buffer pool (session only)
+# Temporarily increase buffer pool (session only)
 test_larger_buffer_pool() {
 	local mysql_cmd=$(get_mysql_command)
 	
-	log_step "Testing larger buffer pool (temporary change).."
+	log_step "Testing larger buffer pool (temporary change)..."
 	
 	echo -e "${WHITE}Current buffer pool:${NC}"
 	"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -e "SELECT ROUND(@@innodb_buffer_pool_size/1024/1024/1024, 3) AS current_buffer_pool_GB;"
@@ -413,7 +596,7 @@ test_larger_buffer_pool() {
 	free -h | grep Mem
 	
 	log_warning "Buffer pool size requires MariaDB restart to change"
-	log_info "Let's create a simple config change.."
+	log_info "Let's create a simple config change..."
 	
 	local config_file=""
 	local possible_configs=(
@@ -443,7 +626,7 @@ test_larger_buffer_pool() {
 	log_success "Backed up to: $backup_file"
 	
 	local total_ram_gb=$(free -g | awk '/^Mem:/{print $2}')
-	local suggested_buffer_gb=$((total_ram_gb * 50 / 100))  # Conservative 50%
+	local suggested_buffer_gb=$((total_ram_gb * 50 / 100))
 	
 	log_info "Suggested buffer pool: ${suggested_buffer_gb}GB (50% of ${total_ram_gb}GB RAM)"
 	
@@ -483,7 +666,7 @@ test_larger_buffer_pool() {
 	log_success "Configuration updated!"
 	
 	echo -e "${YELLOW}Next steps:${NC}"
-	echo "1. sudo /bin/systemctl restart mariadb"
+	echo "1. sudo systemctl restart mariadb"
 	echo "2. Verify: mariadb -u test_user -ptest_password -e \"SELECT @@innodb_buffer_pool_size/1024/1024/1024 AS buffer_pool_GB;\""
 	echo "3. Test your import: ./rockdbutil.sh -i your_backup.tar.gz"
 	echo
@@ -492,7 +675,7 @@ test_larger_buffer_pool() {
 	echo "• DB_B: 28min → 14-20min"
 	echo
 	echo -e "${CYAN}If you want to revert:${NC}"
-	echo "sudo cp $backup_file $config_file && sudo /bin/systemctl restart mariadb"
+	echo "sudo cp $backup_file $config_file && sudo systemctl restart mariadb"
 }
 
 verify_buffer_pool_change() {
@@ -526,7 +709,6 @@ verify_buffer_pool_change() {
 	fi
 }
 
-# function to test import with just buffer pool optimization
 test_import_with_buffer_optimization() {
 	local archive_file="$1"
 	
@@ -535,17 +717,17 @@ test_import_with_buffer_optimization() {
 		return 1
 	fi
 	
-	log_step "Testing import performance with optimized buffer pool.."
+	log_step "Testing import performance with optimized buffer pool..."
 	
 	verify_buffer_pool_change
 	
 	local mysql_cmd=$(get_mysql_command)
-	log_info "Applying basic import optimizations.."
+	log_info "Applying basic import optimizations..."
 	
 	"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" << 'EOF'
-SET GLOBAL foreign_key_checks = 0;
-SET GLOBAL unique_checks = 0;
-SET GLOBAL autocommit = 0;
+SET SESSION foreign_key_checks = 0;
+SET SESSION unique_checks = 0;
+SET SESSION autocommit = 0;
 EOF
 	
 	local start_time=$(date +%s)
@@ -560,21 +742,20 @@ EOF
 	
 	# Restore safe settings
 	"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" << 'EOF'
-SET GLOBAL foreign_key_checks = 1;
-SET GLOBAL unique_checks = 1;
-SET GLOBAL autocommit = 1;
+SET SESSION foreign_key_checks = 1;
+SET SESSION unique_checks = 1;
+SET SESSION autocommit = 1;
 EOF
 	
 	log_success "Import completed in ${minutes}m ${seconds}s"
 	
-	# Compare to previous times
 	echo -e "${CYAN}Performance comparison:${NC}"
 	echo "• Previous time: Your baseline (14min DB_A - 350mb, 28min DB_B - 700mb)"
 	echo "• This test: ${minutes}m ${seconds}s"
 	
 	if [[ $duration -lt 840 ]]; then  # 14min
 		echo -e "${GREEN}Significant improvement! Buffer pool optimization worked!${NC}"
-	elif [[ $duration -lt 1200 ]]; then  # 20min 
+	elif [[ $duration -lt 1200 ]]; then  # 20min  
 		echo -e "${YELLOW}Good improvement! Some benefit from buffer pool${NC}"
 	else
 		echo -e "${RED}Limited improvement - may need additional optimizations${NC}"
@@ -687,18 +868,24 @@ show_usage() {
 	echo -e "${WHITE}MariaDB Import/Export Tool${NC}"
 	echo -e "${WHITE}Usage:${NC}"
 	echo "  $0 -e                        # Export database to compressed archive"
-	echo "  $0 -i <archive.tar.gz>       # Import database from archive"
-	echo "  $0 -c                        # Configure database connection for single session, Config is at the top of the script for consistant usage"
+	echo "  $0 -i <archive.tar.gz>       # Import database from archive (with buffer optimization)"
+	echo "  $0 -c                        # Configure database connection"
 	echo "  $0 -d -e                     # Export with automatic cleanup"
-	echo "  $0 -d -i <archive.tar.gz>    # Import with automatic cleanup"
+	echo "  $0 -d -i <archive.tar.gz>    # Import with auto-cleanup and auto-optimization"
 	echo "  $0 --help                    # Show this help message"
 	echo
 	echo -e "${WHITE}Examples:${NC}"
 	echo "  $0 -e"
 	echo "  $0 -i db_dump_DB_A_20231201_143022.tar.gz"
 	echo "  $0 -d -e                     # Export and auto-delete temp files"
-	echo "  $0 -d -i backup.tar.gz       # Import and auto-delete temp files"
+	echo "  $0 -d -i backup.tar.gz       # Import with auto-optimization and cleanup"
 	echo "  $0 -c"
+	echo
+	echo -e "${WHITE}Import Features:${NC}"
+	echo "  - Automatic buffer pool optimization for faster imports"
+	echo "  - Adaptive sizing based on available system RAM"
+	echo "  - Temporary configuration (restored after import)"
+	echo "  - Interactive mode asks permission, auto mode (-d) applies automatically"
 	echo
 	echo -e "${WHITE}Directories:${NC}"
 	echo "  Base: ~/database_operations/"
@@ -743,7 +930,7 @@ main() {
 		--verify-buffer)
 			verify_buffer_pool_change
 			;;
-		--test-import-buffer)
+		--test-import-buffer):
 			test_import_with_buffer_optimization "${args[1]:-}"
 			;;
 		*)
