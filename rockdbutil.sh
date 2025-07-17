@@ -23,6 +23,12 @@ CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 NC='\033[0m' 
 
+# === GLOBAL VARIABLES ===
+THREAD_COUNT_OVERRIDE=""
+MYSQL_HOST_PARAMS=""
+MYSQL_PORT_PARAMS=""
+AUTO_CLEANUP_CONFIG=""
+
 # === LOGGING FUNCTIONS ===
 log_info() {
 	echo -e "${BLUE}[INFO]${NC} $1"
@@ -49,9 +55,13 @@ log_progress() {
 }
 
 # === CONFIGURATION ===
-DB_NAME="test_db"
-DB_USER="test_user"
-DB_PASS="test_password"
+CONFIG_DIR="$HOME/.config"
+CONFIG_FILE="$CONFIG_DIR/rockdbutil.conf"
+
+DB_NAME=""
+DB_USER=""
+DB_PASS=""
+CURRENT_DB_PROFILE=""
 
 BASE_DIR="$HOME/database_operations"
 DUMP_DIR="$BASE_DIR/dumps"
@@ -156,18 +166,181 @@ get_mysqldump_command() {
 	fi
 }
 
+# === CONFIGURATION FILE FUNCTIONS ===
+create_default_config() {
+	log_step "Creating default configuration file.."
+	
+	mkdir -p "$CONFIG_DIR"
+	
+	cat > "$CONFIG_FILE" << 'EOF'
+# rockdbutil Configuration File
+# Format: profile_setting=value
+
+# Default database configuration (used when no -b flag specified) - profle name default
+default_db_name=your_database
+default_db_user=your_user
+default_db_pass=your_password
+default_db_host=localhost
+default_db_port=3306
+
+# Example additional database profile - profle name produciton
+# production_db_name=prod_database
+# production_db_user=prod_user
+# production_db_pass=prod_password
+# production_db_host=prod.example.com
+# production_db_port=3306
+#
+# will be used as follows:
+# rockdbutil -i dbdump.tar.gz -b production
+# rockdbutil -e -b production
+
+# Global settings
+threads_override=0
+auto_cleanup=false
+base_directory=$HOME/database_operations
+buffer_optimization=true
+log_level=info
+
+# If auto_cleanup is false, it will retain the temp files unless if you supply the -d flag.
+# if it is true, it will always remove the temp files.
+EOF
+
+	chmod 600 "$CONFIG_FILE"
+	log_success "Configuration file created: $CONFIG_FILE"
+	log_info "Please edit the configuration file to set your database credentials"
+	log_info "Run: vim $CONFIG_FILE or nano $CONFIG_FILE"
+}
+
+load_database_config() {
+	local profile="${1:-default}"
+	
+	if [[ ! -f "$CONFIG_FILE" ]]; then
+		log_error "Config file not found: $CONFIG_FILE"
+		log_info "Run: $0 --setup to create the configuration file"
+		exit 1
+	fi
+	
+	CURRENT_DB_PROFILE="$profile"
+	
+	# Load profile-specific settings
+	DB_NAME=$(grep "^${profile}_db_name=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"')
+	DB_USER=$(grep "^${profile}_db_user=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"')
+	DB_PASS=$(grep "^${profile}_db_pass=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"')
+	local DB_HOST=$(grep "^${profile}_db_host=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"')
+	local DB_PORT=$(grep "^${profile}_db_port=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"')
+	
+	if [[ -z "$DB_NAME" || -z "$DB_USER" || -z "$DB_PASS" ]]; then
+		log_error "Incomplete database configuration for profile: $profile"
+		log_info "Required: ${profile}_db_name, ${profile}_db_user, ${profile}_db_pass"
+		exit 1
+	fi
+	
+	local threads_override=$(grep "^threads_override=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d '"')
+	local auto_cleanup_config=$(grep "^auto_cleanup=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d '"')
+	local base_dir_config=$(grep "^base_directory=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"')
+	
+	if [[ -n "$threads_override" && "$threads_override" != "0" ]]; then
+		THREAD_COUNT_OVERRIDE="$threads_override"
+	fi
+
+	AUTO_CLEANUP_CONFIG="$auto_cleanup_config"
+
+	if [[ -n "$base_dir_config" && "$base_dir_config" != "" ]]; then
+		BASE_DIR="${base_dir_config/#\$HOME/$HOME}"
+		DUMP_DIR="$BASE_DIR/dumps"
+		EXTRACT_DIR="$BASE_DIR/restore"
+		ERROR_LOG_DIR="$BASE_DIR/logs"
+		ERROR_REPORT="$BASE_DIR/error_report.txt"
+		SUCCESS_LOG="$BASE_DIR/success_log.txt"
+	fi
+	
+	if [[ -n "$DB_HOST" && "$DB_HOST" != "localhost" ]]; then
+		MYSQL_HOST_PARAMS="-h $DB_HOST"
+	fi
+	if [[ -n "$DB_PORT" && "$DB_PORT" != "3306" ]]; then
+		MYSQL_PORT_PARAMS="-P $DB_PORT"
+	fi
+	
+	log_info "Loaded database profile: $profile ($DB_NAME)"
+}
+
+list_database_profiles() {
+	if [[ ! -f "$CONFIG_FILE" ]]; then
+		log_error "Config file not found: $CONFIG_FILE"
+		return 1
+	fi
+	
+	log_info "Available database profiles:"
+	
+	local profiles=$(grep "_db_name=" "$CONFIG_FILE" | sed 's/_db_name=.*//' | sort | uniq)
+	
+	for profile in $profiles; do
+		local db_name=$(grep "^${profile}_db_name=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"')
+		local db_user=$(grep "^${profile}_db_user=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"')
+		local db_host=$(grep "^${profile}_db_host=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"')
+		
+		if [[ "$profile" == "default" ]]; then
+			echo -e "  ${GREEN}$profile${NC} (default) - $db_name @ ${db_host:-localhost} (user: $db_user)"
+		else
+			echo -e "  ${CYAN}$profile${NC} - $db_name @ ${db_host:-localhost} (user: $db_user)"
+		fi
+	done
+}
+
+setup_rockdbutil() {
+	log_step "Setting up rockdbutil.."
+	
+	if [[ ! -f "$CONFIG_FILE" ]]; then
+		create_default_config
+	else
+		log_info "Config file already exists: $CONFIG_FILE"
+	fi
+	
+	setup_directories
+	
+	check_command "parallel"
+	local mysql_cmd=$(get_mysql_command)
+	local mysqldump_cmd=$(get_mysqldump_command)
+	
+	log_success "rockdbutil setup completed successfully"
+	echo
+	echo -e "${WHITE}Next steps:${NC}"
+	echo "1. Edit configuration: vim $CONFIG_FILE or nano $CONFIG_FILE"
+	echo "2. Set your database credentials"
+	echo "3. Test connection: $0 --test-connection"
+	echo "4. Export database: $0 -e"
+	echo "5. Import database: $0 -i backup.tar.gz"
+	echo "If no profile is supplied (no -b flag), it will use the default profile in the config"
+	echo
+	echo -e "${WHITE}Multi-database usage:${NC}"
+	echo "• List profiles: $0 --list-profiles"
+	echo "• Use specific profile: $0 -b production -e"
+}
+
 test_db_connection() {
 	local mysql_cmd=$(get_mysql_command)
 	
-	log_info "Testing database connection..."
-	if ! "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -e "SELECT 1;" &> /dev/null; then
-		log_error "Cannot connect to database. Please check credentials and server status."
+	log_info "Testing database connection.."
+	log_info "Profile: $CURRENT_DB_PROFILE | Database: $DB_NAME | User: $DB_USER"
+	
+	if ! "$mysql_cmd" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS -u "$DB_USER" -p"$DB_PASS" -e "SELECT 1;" &> /dev/null; then
+		log_error "Cannot connect to database. Please check credentials and server status"
+		log_info "Profile: $CURRENT_DB_PROFILE"
+		log_info "Database: $DB_NAME"
+		log_info "User: $DB_USER"
+		log_info "Host: ${MYSQL_HOST_PARAMS:-localhost}"
+		log_info "Port: ${MYSQL_PORT_PARAMS:-3306}"
 		exit 1
 	fi
-	log_success "Database connection successful."
+	log_success "Database connection successful"
 }
 
 get_thread_count() {
+	if [[ -n "$THREAD_COUNT_OVERRIDE" && "$THREAD_COUNT_OVERRIDE" -gt 0 ]]; then
+		echo "$THREAD_COUNT_OVERRIDE"
+		return
+	fi
+	
 	local total_threads
 	if command -v nproc &> /dev/null; then
 		total_threads=$(nproc)
@@ -831,110 +1004,169 @@ EOF
 	return 0
 }
 
-
-# === CONFIGURATION FUNCTION ===
-configure_database() {
-	echo -e "${WHITE}Current Configuration:${NC}"
-	echo -e "  Database Name: ${CYAN}$DB_NAME${NC}"
-	echo -e "  Database User: ${CYAN}$DB_USER${NC}"
-	echo -e "  Database Pass: ${CYAN}***${NC}"
-	echo
-	
-	read -p "$(echo -e "${YELLOW}Change database name? [y/N]:${NC} ")" -n 1 -r
-	echo
-	if [[ $REPLY =~ ^[Yy]$ ]]; then
-		read -p "Enter database name: " DB_NAME
-	fi
-	
-	read -p "$(echo -e "${YELLOW}Change database user? [y/N]:${NC} ")" -n 1 -r
-	echo
-	if [[ $REPLY =~ ^[Yy]$ ]]; then
-		read -p "Enter database user: " DB_USER
-	fi
-	
-	read -p "$(echo -e "${YELLOW}Change database password? [y/N]:${NC} ")" -n 1 -r
-	echo
-	if [[ $REPLY =~ ^[Yy]$ ]]; then
-		read -s -p "Enter database password: " DB_PASS
-		echo
-	fi
-	
-	log_success "Configuration updated"
-}
-
-
 # === USAGE FUNCTION ===
 show_usage() {
-	echo -e "${WHITE}MariaDB Import/Export Tool${NC}"
+	echo -e "${WHITE}rockdbutil - MariaDB/MySQL Import/Export Tool${NC}"
 	echo -e "${WHITE}Usage:${NC}"
-	echo "  $0 -e                        # Export database to compressed archive"
-	echo "  $0 -i <archive.tar.gz>       # Import database from archive (with buffer optimization)"
-	echo "  $0 -c                        # Configure database connection"
-	echo "  $0 -d -e                     # Export with automatic cleanup"
-	echo "  $0 -d -i <archive.tar.gz>    # Import with auto-cleanup and auto-optimization"
-	echo "  $0 --help                    # Show this help message"
+	echo "  $0 --setup                           # Initial setup (creates config file and directories)"
+	echo "  $0 -e [-b profile] [-d]              # Export database"
+	echo "  $0 -i <archive.tar.gz> [-b profile] [-d]  # Import database"
+	echo "  $0 --list-profiles                   # List available database profiles"
+	echo "  $0 --test-connection [-b profile]    # Test database connection"
+	echo
+	echo -e "${WHITE}Options:${NC}"
+	echo "  -b, --database PROFILE               # Use specific database profile"
+	echo "                                       # If not specified, uses 'default' profile"
+	echo "  -d, --auto-cleanup                   # Automatic cleanup of temporary files"
+	echo "                                       # Also applies buffer pool optimization for imports"
+	echo "  -e, --export                         # Export database to compressed archive"
+	echo "  -i, --import FILE                    # Import database from compressed archive"
+	echo "  -h, --help                           # Show this help message"
 	echo
 	echo -e "${WHITE}Examples:${NC}"
-	echo "  $0 -e"
-	echo "  $0 -i db_dump_DB_A_20231201_143022.tar.gz"
-	echo "  $0 -d -e                     # Export and auto-delete temp files"
-	echo "  $0 -d -i backup.tar.gz       # Import with auto-optimization and cleanup"
-	echo "  $0 -c"
+	echo "  $0 --setup                           # First time setup"
+	echo "  $0 -e                                # Export using default database profile"
+	echo "  $0 -e -b production                  # Export using 'production' database profile"
+	echo "  $0 -e -d                             # Export with automatic cleanup"
+	echo "  $0 -i backup.tar.gz                  # Import to default database"
+	echo "  $0 -i backup.tar.gz -b staging       # Import to 'staging' database profile"
+	echo "  $0 -i backup.tar.gz -d               # Import with auto-cleanup and optimization"
+	echo "  $0 -d -i backup.tar.gz -b production # Auto-optimized import to production"
 	echo
-	echo -e "${WHITE}Import Features:${NC}"
-	echo "  - Automatic buffer pool optimization for faster imports"
-	echo "  - Adaptive sizing based on available system RAM"
-	echo "  - Temporary configuration (restored after import)"
-	echo "  - Interactive mode asks permission, auto mode (-d) applies automatically"
+	echo -e "${WHITE}Database Profiles:${NC}"
+	echo "  Multiple database configurations can be stored in the config file"
+	echo "  Profile format: profilename_db_name, profilename_db_user, profilename_db_pass"
+	echo "  Examples: production_db_name, staging_db_name, dev_db_name"
+	echo
+	echo -e "${WHITE}Configuration:${NC}"
+	echo "  Config file: ~/.config/rockdbutil.conf"
+	echo "  Edit with: vim ~/.config/rockdbutil.conf or nano ~/.config/rockdbutil.conf"
+	echo "  List profiles: $0 --list-profiles"
+	echo "  Test connection: $0 --test-connection -b profilename"
 	echo
 	echo -e "${WHITE}Directories:${NC}"
-	echo "  Base: ~/database_operations/"
+	echo "  Base: ~/database_operations/ (configurable in config file)"
 	echo "  Dumps: ~/database_operations/dumps/"
 	echo "  Restore: ~/database_operations/restore/"
+	echo "  Logs: ~/database_operations/logs/"
+	echo
+	echo -e "${WHITE}Performance Features:${NC}"
+	echo "  • Parallel processing (auto-detects CPU cores)"
+	echo "  • Automatic buffer pool optimization for imports"
+	echo "  • Intelligent retry logic for failed imports"
 }
 
 # === MAIN SCRIPT ===
 main() {
 	if [[ $EUID -eq 0 ]]; then
-		log_warning "Running as root. This is not recommended for database operations."
+		log_warning "Running as root. This is not recommended for database operations"
 	fi
 	
-	# Parse for auto-cleanup flag
+	# Parse arguments
 	local auto_cleanup=false
-	local args=()
+	local database_profile="default"
+	local command=""
+	local archive_file=""
 	
-	for arg in "$@"; do
-		if [[ "$arg" == "-d" ]]; then
-			auto_cleanup=true
-		else
-			args+=("$arg")
-		fi
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+			-d|--auto-cleanup)
+				auto_cleanup=true
+				shift
+				;;
+			-b|--database)
+				database_profile="$2"
+				shift 2
+				;;
+			-e|export)
+				command="export"
+				shift
+				;;
+			-i|import)
+				command="import"
+				archive_file="$2"
+				shift 2
+				;;
+			--setup|setup)
+				command="setup"
+				shift
+				;;
+			--list-profiles)
+				command="list-profiles"
+				shift
+				;;
+			--test-connection)
+				command="test-connection"
+				shift
+				;;
+			--help|-h|help)
+				command="help"
+				shift
+				;;
+			--test-buffer)
+				command="test-buffer"
+				shift
+				;;
+			--verify-buffer)
+				command="verify-buffer"
+				shift
+				;;
+			--test-import-buffer)
+				command="test-import-buffer"
+				archive_file="$2"
+				shift 2
+				;;
+			*)
+				log_error "Invalid option: $1"
+				show_usage
+				exit 1
+				;;
+		esac
 	done
 	
-	case "${args[0]:-}" in
-		-e|export)
+	if [[ "$command" == "setup" ]]; then
+		setup_rockdbutil
+		return
+	fi
+	
+	if [[ "$command" != "help" && "$command" != "list-profiles" ]]; then
+		load_database_config "$database_profile"
+		
+		if [[ "$auto_cleanup" == "false" && "$AUTO_CLEANUP_CONFIG" == "true" ]]; then
+			auto_cleanup=true
+		fi
+	fi
+	
+	case "$command" in
+		export)
 			export_database "$auto_cleanup"
 			;;
-		-i|import)
-			import_database "${args[1]:-}" "$auto_cleanup"
+		import)
+			import_database "$archive_file" "$auto_cleanup"
 			;;
-		-c|config)
+		config)
 			configure_database
 			;;
-		--help|-h|help)
-			show_usage
+		list-profiles)
+			list_database_profiles
 			;;
-		--test-buffer)
+		test-connection)
+			test_db_connection
+			;;
+		test-buffer)
 			test_larger_buffer_pool
 			;;
-		--verify-buffer)
+		verify-buffer)
 			verify_buffer_pool_change
 			;;
-		--test-import-buffer):
-			test_import_with_buffer_optimization "${args[1]:-}"
+		test-import-buffer)
+			test_import_with_buffer_optimization "$archive_file"
+			;;
+		help|"")
+			show_usage
 			;;
 		*)
-			log_error "Invalid option: ${args[0]:-}"
+			log_error "No command specified"
 			show_usage
 			exit 1
 			;;

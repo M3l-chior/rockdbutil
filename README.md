@@ -17,14 +17,23 @@ Fast, reliable MariaDB/MySQL import/export tool with parallel processing and aut
 wget https://raw.githubusercontent.com/M3l-chior/rockdbutil/main/rockdbutil.sh
 chmod +x rockdbutil.sh
 
-# Configure (edit the script top section)
-vim rockdbutil.sh  # Set DB_NAME, DB_USER, DB_PASS
+# Setup (first time only)
+./rockdbutil.sh --setup
 
-# Export database
+# Configure (edit the generated config file)
+vim ~/.config/rockdbutil.conf  # Set your database credentials
+
+# Export database (default profile)
 ./rockdbutil.sh -e
 
-# Import database  
+# Export specific database profile
+./rockdbutil.sh -e -b production
+
+# Import database (default profile)
 ./rockdbutil.sh -i db_dump_mydb_20231201_143022.tar.gz
+
+# Import to specific database profile
+./rockdbutil.sh -i db_dump_mydb_20231201_143022.tar.gz -b staging
 ```
 
 ## Prerequisites
@@ -39,11 +48,15 @@ Auto-installed by script:
 ## Usage
 
 ```bash
-./rockdbutil.sh -e                    # Export database - Retains all .sql files and archive
-./rockdbutil.sh -i backup.tar.gz      # Import database - Extracts and retains temp files
-./rockdbutil.sh -d -e                 # Export with auto-cleanup - Retains just the archive
-./rockdbutil.sh -d -i backup.tar.gz   # Import with auto-cleanup - Retains just the archive
-./rockdbutil.sh -c                    # Configure connection for single session
+./rockdbutil.sh --setup                         # Initial setup (creates config and directories)
+./rockdbutil.sh -e                              # Export default database
+./rockdbutil.sh -e -b production                # Export specific database profile
+./rockdbutil.sh -i backup.tar.gz                # Import to default database
+./rockdbutil.sh -i backup.tar.gz -b staging     # Import to specific database profile
+./rockdbutil.sh -d -e                           # Export with auto-cleanup
+./rockdbutil.sh -d -i backup.tar.gz -b prod     # Import with auto-cleanup and optimization
+./rockdbutil.sh --list-profiles                 # List available database profiles
+./rockdbutil.sh --test-connection -b production # Test specific database connection
 ```
 
 ## Performance
@@ -80,13 +93,69 @@ Auto-installed by script:
 
 ## Configuration
 
-Edit the top of `rockdbutil.sh`:
+The configuration file is located at `~/.config/rockdbutil.conf` and supports multiple database profiles:
 
 ```bash
-DB_NAME="your_database"
-DB_USER="your_user" 
-DB_PASS="your_password"
+# Default database (used when no -b flag specified)
+default_db_name=your_database
+default_db_user=your_user
+default_db_pass=your_password
+default_db_host=localhost
+default_db_port=3306
+
+# Production database profile
+production_db_name=prod_database
+production_db_user=prod_user
+production_db_pass=prod_password
+production_db_host=prod.company.com
+production_db_port=3306
+
+# Staging database profile
+staging_db_name=staging_db
+staging_db_user=staging_user
+staging_db_pass=staging_password
+staging_db_host=staging.company.com
+
+# Global settings
+threads_override=0
+auto_cleanup=false
+base_directory=$HOME/database_operations
+buffer_optimization=true
 ```
+
+If auto_cleanup=true then no -d flag is required when running the script.
+
+**Create config file:** `./rockdbutil.sh --setup`
+
+## Multi-Database Usage
+
+Configure multiple database profiles for different environments:
+
+```bash
+# First time setup
+./rockdbutil.sh --setup
+
+# Edit configuration file
+vim ~/.config/rockdbutil.conf
+
+# List available profiles
+./rockdbutil.sh --list-profiles
+
+# Test connections to different profiles if setup in the config
+./rockdbutil.sh --test-connection -b production
+./rockdbutil.sh --test-connection -b staging
+./rockdbutil.sh --test-connection -b dev
+
+# Use specific database profiles
+./rockdbutil.sh -e -b production             # Export from production
+./rockdbutil.sh -i backup.tar.gz -b staging  # Import to staging
+./rockdbutil.sh -d -i backup.tar.gz -b dev   # Import to dev with optimization
+```
+
+**Profile naming:** Use the prefix before `_db_name` as your profile name
+- `production_db_name=prod_db` = Profile: `production`
+- `dev_db_name=local_db` = Profile: `dev`
+- `client_a_db_name=alpha_db` = Profile: `client_a`
 
 ## Troubleshooting
 
