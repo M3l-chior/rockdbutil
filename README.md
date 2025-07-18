@@ -63,7 +63,7 @@ Auto-installed by script:
 
 **Tested Performance Comparison:**
 
-**700MB Database (1,256 Tables):**
+**6.5GB Database - 700MB Compressed (1,256 Tables):**
 - **Before:** `mariadb -u user -ppassword database_name < file.sql` - 28min
 - **After:** `./rockdbutil.sh -i database_name.tar.gz` - 13min
 - **Improvement:** 54% faster
