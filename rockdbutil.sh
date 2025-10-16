@@ -25,6 +25,7 @@ NC='\033[0m'
 
 # === GLOBAL VARIABLES ===
 THREAD_COUNT_OVERRIDE=""
+THREAD_MODE="conservative"
 MYSQL_HOST_PARAMS=""
 MYSQL_PORT_PARAMS=""
 AUTO_CLEANUP_CONFIG=""
@@ -71,7 +72,7 @@ ERROR_REPORT="$BASE_DIR/error_report.txt"
 SUCCESS_LOG="$BASE_DIR/success_log.txt"
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-ARCHIVE_NAME="db_dump_${DB_NAME}_${TIMESTAMP}.tar.gz"
+ARCHIVE_NAME=""
 
 # === UTILITY FUNCTIONS ===
 detect_distro() {
@@ -111,13 +112,22 @@ install_package() {
 	
 	case $pkg_manager in
 		pacman)
-			sudo pacman -S --noconfirm "$package"
+			# Handle package names for Arch
+			if [[ "$package" == "procps-ng" ]]; then
+				sudo pacman -S --noconfirm procps-ng
+			else
+				sudo pacman -S --noconfirm "$package"
+			fi
 			;;
 		apt)
+			# Handle package name for Deb/Ubuntu
+			if [[ "$package" == "procps-ng" ]]; then
+				package="procps"
+			fi
 			sudo apt update && sudo apt install -y "$package"
 			;;
 	esac
-}
+	}
 
 check_command() {
 	local cmd=$1
@@ -176,7 +186,7 @@ create_default_config() {
 # rockdbutil Configuration File
 # Format: profile_setting=value
 
-# Default database configuration (used when no -b flag specified) - profle name default
+# Default database configuration (used when no -db flag specified) - profle name default
 default_db_name=your_database
 default_db_user=your_user
 default_db_pass=your_password
@@ -191,11 +201,12 @@ default_db_port=3306
 # production_db_port=3306
 #
 # will be used as follows:
-# rockdbutil -i dbdump.tar.gz -b production
-# rockdbutil -e -b production
+# rockdbutil -i dbdump.tar.gz -db production
+# rockdbutil -e -db production
 
 # Global settings
 threads_override=0
+thread_mode=max
 auto_cleanup=false
 base_directory=$HOME/database_operations
 buffer_optimization=true
@@ -241,6 +252,13 @@ load_database_config() {
 	
 	if [[ -n "$threads_override" && "$threads_override" != "0" ]]; then
 		THREAD_COUNT_OVERRIDE="$threads_override"
+	fi
+
+	local thread_mode=$(grep "^thread_mode=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d '"')
+	if [[ -n "$thread_mode" ]]; then
+		THREAD_MODE="$thread_mode"
+	else
+		THREAD_MODE="conservative"
 	fi
 
 	AUTO_CLEANUP_CONFIG="$auto_cleanup_config"
@@ -299,6 +317,10 @@ setup_rockdbutil() {
 	setup_directories
 	
 	check_command "parallel"
+	check_command "bc"
+	check_command "gzip"
+	check_command "tar" 
+	check_command "pgrep" "procps-ng"
 	local mysql_cmd=$(get_mysql_command)
 	local mysqldump_cmd=$(get_mysqldump_command)
 	
@@ -310,11 +332,11 @@ setup_rockdbutil() {
 	echo "3. Test connection: $0 --test-connection"
 	echo "4. Export database: $0 -e"
 	echo "5. Import database: $0 -i backup.tar.gz"
-	echo "If no profile is supplied (no -b flag), it will use the default profile in the config"
+	echo "If no profile is supplied (no -db flag), it will use the default profile in the config"
 	echo
 	echo -e "${WHITE}Multi-database usage:${NC}"
 	echo "• List profiles: $0 --list-profiles"
-	echo "• Use specific profile: $0 -b production -e"
+	echo "• Use specific profile: $0 -db production -e"
 }
 
 test_db_connection() {
@@ -350,10 +372,14 @@ get_thread_count() {
 		total_threads=4
 	fi
 	
-	# Use total threads - 2, but minimum of 1
-	local threads=$((total_threads - 2))
-	if [[ $threads -lt 1 ]]; then
-		threads=1
+	local threads
+	if [[ "$THREAD_MODE" == "max" ]]; then
+		threads=$total_threads
+	else
+		threads=$((total_threads - 2))
+		if [[ $threads -lt 1 ]]; then
+			threads=1
+		fi
 	fi
 	
 	echo "$threads"
@@ -402,71 +428,47 @@ get_optimal_buffer_size() {
 
 apply_temporary_buffer_optimization() {
 	local target_buffer_gb="$1"
-
-	if ! sudo -n true 2>/dev/null; then
-		log_info "Requesting sudo access for buffer pool optimization.."
-		sudo -v
-	fi
-
+	local target_buffer_bytes=$((target_buffer_gb * 1024 * 1024 * 1024))
+	
 	local mysql_cmd=$(get_mysql_command)
-
-    local current_buffer_gb=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -e "SELECT ROUND(@@innodb_buffer_pool_size/1024/1024/1024, 2);" 2>/dev/null | tail -n +2)
-    
-    if (( $(echo "$target_buffer_gb > $current_buffer_gb" | bc -l 2>/dev/null || echo "0") )); then
-        log_info "Temporarily increasing buffer pool from ${current_buffer_gb}GB to ${target_buffer_gb}GB for import"
-        
-        local config_file=""
-        local possible_configs=(
-            "/etc/mysql/mariadb.conf.d/50-server.cnf"
-            "/etc/mysql/mysql.conf.d/mysqld.cnf" 
-            "/etc/mysql/my.cnf"
-            "/etc/my.cnf"
-        )
-        
-        for config in "${possible_configs[@]}"; do
-            if [[ -f "$config" ]]; then
-                config_file="$config"
-                break
-            fi
-        done
-        
-        if [[ -n "$config_file" ]]; then
-            local backup_file="${config_file}.temp_import.$(date +%Y%m%d_%H%M%S)"
-            sudo cp "$config_file" "$backup_file"
-            
-            sudo sed -i '/^innodb_buffer_pool_size/d' "$config_file"
-            if grep -q "^\[mysqld\]" "$config_file"; then
-                sudo sed -i '/^\[mysqld\]/a innodb_buffer_pool_size = '"${target_buffer_gb}G" "$config_file"
-            else
-                echo -e "\n[mysqld]\ninnodb_buffer_pool_size = ${target_buffer_gb}G" | sudo tee -a "$config_file" >/dev/null
-            fi
-            
-            log_info "Restarting MariaDB with optimized buffer pool..."
-            sudo systemctl restart mariadb
-            sleep 3
-            
-            echo "$backup_file" > "$BASE_DIR/temp_config_backup"
-            return 0
-        fi
-    fi
-    
-    return 1
+	
+	log_info "Temporarily increasing buffer pool to ${target_buffer_gb}GB for import"
+	
+	local current_buffer_bytes=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -sN -e "SELECT @@innodb_buffer_pool_size;" 2>/dev/null)
+	echo "$current_buffer_bytes" > "$BASE_DIR/.original_buffer_size"
+	
+	# Apply new buffer pool size (requires SUPER privilege)
+	if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -e "SET GLOBAL innodb_buffer_pool_size = $target_buffer_bytes;" 2>/dev/null; then
+		log_success "Buffer pool increased to ${target_buffer_gb}GB"
+		return 0
+	else
+		log_warning "Failed to change buffer pool - user may need SUPER privilege"
+		log_info "Grant with: GRANT SUPER ON *.* TO '$DB_USER'@'localhost'; FLUSH PRIVILEGES;"
+		rm -f "$BASE_DIR/.original_buffer_size"
+		return 1
+	fi
 }
 
 restore_original_buffer_config() {
-    local backup_file_location="$BASE_DIR/temp_config_backup"
-    
-    if [[ -f "$backup_file_location" ]]; then
-        local backup_file=$(cat "$backup_file_location")
-        if [[ -f "$backup_file" ]]; then
-            log_info "Restoring original buffer pool configuration..."
-            sudo cp "$backup_file" "${backup_file%.temp_import.*}"
-            sudo systemctl restart mariadb
-            sleep 3
-            sudo rm -f "$backup_file" "$backup_file_location"
-            log_success "Original configuration restored"
-        fi
-    fi
+	local original_size_file="$BASE_DIR/.original_buffer_size"
+	
+	if [[ ! -f "$original_size_file" ]]; then
+		return 0
+	fi
+	
+	local original_bytes=$(cat "$original_size_file")
+	local original_gb=$((original_bytes / 1024 / 1024 / 1024))
+	
+	local mysql_cmd=$(get_mysql_command)
+	
+	log_info "Restoring original buffer pool to ${original_gb}GB"
+	
+	if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -e "SET GLOBAL innodb_buffer_pool_size = $original_bytes;" 2>/dev/null; then
+		log_success "Original buffer pool restored"
+		rm -f "$original_size_file"
+	else
+		log_warning "Failed to restore buffer pool"
+	fi
 }
 
 setup_directories() {
@@ -487,7 +489,11 @@ export_database() {
 	log_step "Starting database export process.."
 	
 	check_command "parallel"
+	check_command "tar"
+	check_command "gzip"
 	test_db_connection
+
+	ARCHIVE_NAME="db_dump_${DB_NAME}_${TIMESTAMP}.tar.gz"
 	
 	local mysql_cmd=$(get_mysql_command)
 	local mysqldump_cmd=$(get_mysqldump_command)
@@ -580,6 +586,7 @@ import_database() {
 	log_step "Starting database import process.."
 	
 	check_command "parallel"
+	check_command "bc"
 	test_db_connection
 
 	local buffer_info=$(get_optimal_buffer_size)
@@ -589,7 +596,6 @@ import_database() {
 
 	local mysql_cmd=$(get_mysql_command)
 	
-	# Detailed system info
 	echo -e "${WHITE}System Memory Status:${NC}"
 	echo "Total RAM: ${total_ram_gb}GB"
 	echo "Available: $(free -h | awk '/^Mem:/{print $7}')"
@@ -616,7 +622,6 @@ import_database() {
 		log_info "Buffer optimization will be applied: ${current_buffer_gb}GB → ${suggested_buffer_gb}GB"
 		
 		if [[ "$auto_cleanup" == "true" ]]; then
-			# Auto mode
 			if apply_temporary_buffer_optimization "$suggested_buffer_gb"; then
 				use_buffer_optimization=true
 				cleanup_buffer=true
@@ -714,12 +719,56 @@ import_database() {
 	export -f import_single_file
 	export DB_USER DB_PASS DB_NAME ERROR_LOG_DIR ERROR_REPORT SUCCESS_LOG
 
+	local total_files=$(find "$EXTRACT_DIR" -name "*.sql" | wc -l)
+
+	monitor_import_progress() {
+		local total=$1
+		local start_time=$(date +%s)
+		local last_count=0
+		local last_log_time=$start_time
+		
+		while true; do
+			if [[ -f "$SUCCESS_LOG" ]]; then
+				local completed=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
+				local current_time=$(date +%s)
+				local time_since_last_log=$((current_time - last_log_time))
+				
+				if [[ $completed -gt $last_count && $completed -gt 0 ]]; then
+					local elapsed=$((current_time - start_time))
+					local minutes=$((elapsed / 60))
+					local seconds=$((elapsed % 60))
+					
+					log_progress "Imported $completed/$total tables (${minutes}m ${seconds}s elapsed)"
+					last_count=$completed
+					last_log_time=$current_time
+				elif [[ $time_since_last_log -ge 10 && $completed -gt 0 ]]; then
+					local remaining=$((total - completed))
+					log_progress "Still working: $completed/$total complete, $remaining remaining (processing large tables)"
+					last_log_time=$current_time
+				fi
+			fi
+			sleep 3
+			
+			# Check if import is complete
+			if ! pgrep -f "parallel.*import_single_file" > /dev/null; then
+				break
+			fi
+		done
+	}
+
+	monitor_import_progress "$total_files" &
+	local monitor_pid=$!
+
 	local import_success=false
 	if parallel -j "$threads" import_single_file {} "$mysql_cmd" ::: "$EXTRACT_DIR"/*.sql; then
+		kill $monitor_pid 2>/dev/null
+		wait $monitor_pid 2>/dev/null
 		local success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
 		log_success "All $success_count SQL files imported successfully"
 		import_success=true
 	else
+		kill $monitor_pid 2>/dev/null
+		wait $monitor_pid 2>/dev/null
 		local success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
 		local total_files=$(find "$EXTRACT_DIR" -name "*.sql" | wc -l)
 		local failed_count=$((total_files - success_count))
@@ -744,7 +793,6 @@ import_database() {
 	fi
 	
 	if [[ "$use_buffer_optimization" == "true" ]]; then
-		sudo -v 2>/dev/null || sudo -v
 		restore_original_buffer_config
 	fi
 	
@@ -1008,30 +1056,30 @@ EOF
 show_usage() {
 	echo -e "${WHITE}rockdbutil - MariaDB/MySQL Import/Export Tool${NC}"
 	echo -e "${WHITE}Usage:${NC}"
-	echo "  $0 --setup                           # Initial setup (creates config file and directories)"
-	echo "  $0 -e [-b profile] [-d]              # Export database"
-	echo "  $0 -i <archive.tar.gz> [-b profile] [-d]  # Import database"
-	echo "  $0 --list-profiles                   # List available database profiles"
-	echo "  $0 --test-connection [-b profile]    # Test database connection"
+	echo "  $0 --setup                              # Initial setup (creates config file and directories)"
+	echo "  $0 -e [-db profile] [-d]                # Export database"
+	echo "  $0 -i <archive.tar.gz> [-db profile] [-d]  # Import database"
+	echo "  $0 --list-profiles                      # List available database profiles"
+	echo "  $0 --test-connection [-db profile]      # Test database connection"
 	echo
 	echo -e "${WHITE}Options:${NC}"
-	echo "  -b, --database PROFILE               # Use specific database profile"
-	echo "                                       # If not specified, uses 'default' profile"
-	echo "  -d, --auto-cleanup                   # Automatic cleanup of temporary files"
-	echo "                                       # Also applies buffer pool optimization for imports"
-	echo "  -e, --export                         # Export database to compressed archive"
-	echo "  -i, --import FILE                    # Import database from compressed archive"
-	echo "  -h, --help                           # Show this help message"
+	echo "  -db, --database PROFILE                 # Use specific database profile"
+	echo "                                          # If not specified, uses 'default' profile"
+	echo "  -d, --auto-cleanup                      # Automatic cleanup of temporary files"
+	echo "                                          # Also applies buffer pool optimization for imports"
+	echo "  -e, --export                            # Export database to compressed archive"
+	echo "  -i, --import FILE                       # Import database from compressed archive"
+	echo "  -h, --help                              # Show this help message"
 	echo
 	echo -e "${WHITE}Examples:${NC}"
-	echo "  $0 --setup                           # First time setup"
-	echo "  $0 -e                                # Export using default database profile"
-	echo "  $0 -e -b production                  # Export using 'production' database profile"
-	echo "  $0 -e -d                             # Export with automatic cleanup"
-	echo "  $0 -i backup.tar.gz                  # Import to default database"
-	echo "  $0 -i backup.tar.gz -b staging       # Import to 'staging' database profile"
-	echo "  $0 -i backup.tar.gz -d               # Import with auto-cleanup and optimization"
-	echo "  $0 -d -i backup.tar.gz -b production # Auto-optimized import to production"
+	echo "  $0 --setup                              # First time setup"
+	echo "  $0 -e                                   # Export using default database profile"
+	echo "  $0 -e -db production                    # Export using 'production' database profile"
+	echo "  $0 -e -d                                # Export with automatic cleanup"
+	echo "  $0 -i backup.tar.gz                     # Import to default database"
+	echo "  $0 -i backup.tar.gz -db staging         # Import to 'staging' database profile"
+	echo "  $0 -i backup.tar.gz -d                  # Import with auto-cleanup and optimization"
+	echo "  $0 -d -i backup.tar.gz -db production   # Auto-optimized import to production"
 	echo
 	echo -e "${WHITE}Database Profiles:${NC}"
 	echo "  Multiple database configurations can be stored in the config file"
@@ -1042,7 +1090,7 @@ show_usage() {
 	echo "  Config file: ~/.config/rockdbutil.conf"
 	echo "  Edit with: vim ~/.config/rockdbutil.conf or nano ~/.config/rockdbutil.conf"
 	echo "  List profiles: $0 --list-profiles"
-	echo "  Test connection: $0 --test-connection -b profilename"
+	echo "  Test connection: $0 --test-connection -db profilename"
 	echo
 	echo -e "${WHITE}Directories:${NC}"
 	echo "  Base: ~/database_operations/ (configurable in config file)"
@@ -1074,7 +1122,7 @@ main() {
 				auto_cleanup=true
 				shift
 				;;
-			-b|--database)
+			-db|--database)
 				database_profile="$2"
 				shift 2
 				;;
