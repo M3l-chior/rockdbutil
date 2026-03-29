@@ -952,7 +952,7 @@ import_database() {
 		local sql_file="$1"
 		local mysql_cmd="$2"
 		local chunks="$3"
-		local filename=$(basename "$sql_file"):%s/ —/-/g
+		local filename=$(basename "$sql_file")
 		local error_log="$ERROR_LOG_DIR/${filename}.chunk.error"
 		local table_name="${filename%.sql}"
 
