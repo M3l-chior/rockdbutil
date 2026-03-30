@@ -618,6 +618,41 @@ apply_import_optimizations() {
 		fi
 	fi
 
+	# Suppress binlog writes during import - parallel INSERT streams would otherwise generate
+	# several GB of binlog for data that already exists in the dump. The binlog position
+	# recorded at export time is what matters for selective restore; import events are noise.
+	# sql_log_bin is session-level - export an env flag so worker sessions (parallel, chunks)
+	# also prepend SET SESSION sql_log_bin = 0 to every import they run.
+	local current_sql_log_bin
+	current_sql_log_bin=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -sN \
+		-e "SELECT @@SESSION.sql_log_bin;" 2>/dev/null)
+	echo "${current_sql_log_bin:-1}" > "$BASE_DIR/.original_sql_log_bin"
+
+	if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" \
+		-e "SET SESSION sql_log_bin = 0;" 2>/dev/null; then
+		log_success "sql_log_bin disabled (binlog writes suppressed for import)"
+		export ROCKDBUTIL_SUPPRESS_BINLOG=1
+	else
+		log_warning "Could not disable sql_log_bin - binlog will be written during import"
+		log_info "Grant with: GRANT SUPER ON *.* TO '$DB_USER'@'localhost'; FLUSH PRIVILEGES;"
+		rm -f "$BASE_DIR/.original_sql_log_bin"
+	fi
+
+	# Suppress slow query log during import - chunk imports are intentionally long-running
+	# and would flood slow.log with noise that is not actionable.
+	local current_slow_log
+	current_slow_log=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -sN \
+		-e "SELECT @@GLOBAL.slow_query_log;" 2>/dev/null)
+	echo "${current_slow_log:-1}" > "$BASE_DIR/.original_slow_query_log"
+
+	if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" \
+		-e "SET GLOBAL slow_query_log = 0;" 2>/dev/null; then
+		log_success "slow_query_log disabled for import duration"
+	else
+		log_warning "Could not disable slow_query_log - slow.log will grow during import"
+		rm -f "$BASE_DIR/.original_slow_query_log"
+	fi
+
 	return 0
 }
 
@@ -690,6 +725,35 @@ restore_import_optimizations() {
 			log_warning "Failed to restore innodb_io_capacity"
 		fi
 		rm -f "$io_capacity_file" "$io_capacity_max_file"
+	fi
+
+	local sql_log_bin_file="$BASE_DIR/.original_sql_log_bin"
+	if [[ -f "$sql_log_bin_file" ]]; then
+		local original_sql_log_bin
+		original_sql_log_bin=$(cat "$sql_log_bin_file")
+		log_info "Restoring sql_log_bin to $original_sql_log_bin"
+		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" \
+			-e "SET SESSION sql_log_bin = $original_sql_log_bin;" 2>/dev/null; then
+			log_success "sql_log_bin restored"
+		else
+			log_warning "Failed to restore sql_log_bin"
+		fi
+		rm -f "$sql_log_bin_file"
+		unset ROCKDBUTIL_SUPPRESS_BINLOG
+	fi
+
+	local slow_log_file="$BASE_DIR/.original_slow_query_log"
+	if [[ -f "$slow_log_file" ]]; then
+		local original_slow_log
+		original_slow_log=$(cat "$slow_log_file")
+		log_info "Restoring slow_query_log to $original_slow_log"
+		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" \
+			-e "SET GLOBAL slow_query_log = $original_slow_log;" 2>/dev/null; then
+			log_success "slow_query_log restored"
+		else
+			log_warning "Failed to restore slow_query_log"
+		fi
+		rm -f "$slow_log_file"
 	fi
 }
 
@@ -776,6 +840,30 @@ export_database() {
 		log_warning "Failed to export triggers and routines"
 	fi
 	
+	log_step "Recording binlog position at export time.."
+	local master_status
+	master_status=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -sN \
+		-e "SHOW MASTER STATUS;" 2>/dev/null | head -1)
+
+	if [[ -n "$master_status" ]]; then
+		local binlog_file
+		local binlog_position
+		binlog_file=$(echo "$master_status" | awk '{print $1}')
+		binlog_position=$(echo "$master_status" | awk '{print $2}')
+
+		cat > "$DUMP_DIR/__export_meta.txt" <<EOF
+binlog_file=${binlog_file}
+binlog_position=${binlog_position}
+export_timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+db_name=${DB_NAME}
+rockdbutil_version=1.0
+EOF
+		log_success "Binlog position recorded: ${binlog_file}:${binlog_position}"
+	else
+		log_warning "SHOW MASTER STATUS returned no data - binlog position not recorded"
+		log_info "Selective restore auto mode will require --since datetime fallback"
+	fi
+
 	log_step "Creating compressed archive..."
 	if tar -czf "$ARCHIVE_NAME" -C "$DUMP_DIR" . 2>/dev/null; then
 		local archive_size=$(du -h "$ARCHIVE_NAME" | cut -f1)
@@ -792,6 +880,311 @@ if [[ "$auto_cleanup" == "true" ]]; then
 		rm -rf "$ERROR_LOG_DIR"/*
 		log_success "Temporary files automatically cleaned up"
 	fi
+}
+
+# === IMPORT WORKER FUNCTIONS ===
+# Defined at top level so both import_database() and selective_restore() can use them,
+# and so GNU Parallel worker subshells inherit them via export -f.
+
+# chunk_import_file - imports a single large table using N parallel INSERT streams.
+# Streams the .sql file through awk splitting INSERT rows into equal chunks,
+# each chunk piped directly into mariadb. No intermediate chunk files written to disk.
+# The CREATE TABLE / preamble block is imported once first, then row chunks in parallel.
+chunk_import_file() {
+	local sql_file="$1"
+	local mysql_cmd="$2"
+	local chunks="$3"
+	local filename
+	filename=$(basename "$sql_file")
+	local error_log="$ERROR_LOG_DIR/${filename}.chunk.error"
+	local table_name="${filename%.sql}"
+
+	log_progress "Chunked import: $table_name (${chunks} parallel streams)"
+
+	# Step 1: Import the schema block (everything before the first INSERT statement).
+	# Stop at the LOCK TABLES line - the dump format has INSERT INTO `tbl` VALUES
+	# on its own line followed by data rows starting with (, so it must not be included.
+	awk '/^LOCK TABLES / { exit } { print }' "$sql_file" \
+		| "$mysql_cmd" --batch --silent -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" 2>"$error_log"
+
+	if [[ $? -ne 0 ]]; then
+		echo "FAILED: $filename (schema phase)" >> "${ERROR_REPORT}.${table_name}"
+		[[ -s "$error_log" ]] && sed 's/^/    /' "$error_log" >> "${ERROR_REPORT}.${table_name}"
+		return 1
+	fi
+
+	# Step 2: Extract the INSERT header line and count total data rows for chunk division.
+	local header_file="$ERROR_LOG_DIR/${filename}.header.tmp"
+	grep -m 1 "^INSERT INTO" "$sql_file" > "$header_file" || true
+
+	if [[ ! -s "$header_file" ]]; then
+		rm -f "$header_file"
+		echo "$filename" >> "$SUCCESS_LOG"
+		return 0
+	fi
+
+	local total_rows
+	local count_file="${sql_file%.sql}.rowcount"
+	if [[ -f "$count_file" ]]; then
+		total_rows=$(cat "$count_file")
+	else
+		total_rows=$(awk '/^\(/ { count++ } END { print count+0 }' "$sql_file" 2>/dev/null || true)
+	fi
+	total_rows="${total_rows:-0}"
+
+	local rows_per_chunk=0
+	if [[ "$total_rows" -gt 0 ]]; then
+		rows_per_chunk=$(( (total_rows + chunks - 1) / chunks ))
+	fi
+
+	if [[ "$rows_per_chunk" -eq 0 ]]; then
+		echo "FAILED: $filename (could not compute chunk size, total_rows=$total_rows)" >> "${ERROR_REPORT}.${table_name}"
+		return 1
+	fi
+
+	# Step 3: Stream each chunk directly into mariadb in parallel.
+	# Each chunk gets its own transaction wrapper to prevent autocommit-mode
+	# row-by-row locking that causes deadlocks between parallel chunk streams.
+	local chunk_pids=()
+	local chunk_errors=()
+	local chunk_idx=0
+
+	while [[ $chunk_idx -lt $chunks ]]; do
+		local chunk_start=$(( chunk_idx * rows_per_chunk + 1 ))
+		local chunk_end=$(( chunk_start + rows_per_chunk - 1 ))
+		echo "DEBUG chunk$chunk_idx: start=$chunk_start end=$chunk_end total=$total_rows rpc=$rows_per_chunk" >> "$ERROR_LOG_DIR/${filename}.debug"
+		local chunk_error_log="$ERROR_LOG_DIR/${filename}.chunk${chunk_idx}.error"
+		chunk_errors+=("$chunk_error_log")
+
+		{
+			[[ "${ROCKDBUTIL_SUPPRESS_BINLOG:-0}" == "1" ]] && echo "SET SESSION sql_log_bin = 0;"
+			echo "SET foreign_key_checks = 0;"
+			echo "SET unique_checks = 0;"
+			echo "SET autocommit = 0;"
+			echo "START TRANSACTION;"
+			awk -v header_file="$header_file" \
+				-v start="$chunk_start" \
+				-v end="$chunk_end" \
+				-v total_end="$total_rows" '
+				BEGIN {
+					if ((getline header < header_file) <= 0) header = ""
+					close(header_file)
+					start     = start + 0
+					end       = end + 0
+					total_end = total_end + 0
+					row_num   = 0
+					last_line = ""
+					started   = 0
+				}
+				/^\(/ {
+					row_num++
+					if (row_num < start) next
+					if (row_num > end) exit
+					if (row_num == start) {
+						print header
+						started = 1
+					}
+					if (started && last_line != "") {
+						if (last_line ~ /;[[:space:]]*$/) {
+							print last_line
+							print header
+							last_line = ""
+						} else {
+							print last_line
+						}
+					}
+					last_line = $0
+				}
+				END {
+					if (started && last_line != "") {
+						gsub(/[;,][[:space:]]*$/, "", last_line)
+						print last_line ";"
+					}
+				}
+			' "$sql_file"
+			echo "COMMIT;"
+		} | "$mysql_cmd" --batch --silent -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" 2>"$chunk_error_log" &
+
+		chunk_pids+=($!)
+		(( chunk_idx++ )) || true
+	done
+
+	# Wait for all parallel chunk imports to complete
+	local chunk_failed=0
+	local pid_idx=0
+	while [[ $pid_idx -lt ${#chunk_pids[@]} ]]; do
+		if ! wait "${chunk_pids[$pid_idx]}"; then
+			chunk_failed=$(( chunk_failed + 1 ))
+			cat "${chunk_errors[$pid_idx]}" >> "$error_log" 2>/dev/null || true
+		fi
+		(( pid_idx++ )) || true
+	done
+
+	local i=0
+	while [[ $i -lt ${#chunk_errors[@]} ]]; do
+		rm -f "${chunk_errors[$i]}"
+		(( i++ )) || true
+	done
+
+	# If chunks failed due to lock contention, truncate and retry sequentially.
+	# Parallel inserts on tables with unique/primary key indexes cause deadlocks -
+	# sequential retry eliminates contention while preserving transaction-size benefit.
+	if [[ $chunk_failed -gt 0 ]] && grep -q "Lock wait timeout\|Deadlock" "$error_log" 2>/dev/null; then
+		log_warning "$table_name: lock contention on parallel chunks - truncating and retrying sequentially"
+		"$mysql_cmd" --batch --silent -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
+			-e "SET foreign_key_checks = 0; TRUNCATE TABLE \`${table_name}\`;" 2>/dev/null || true
+		> "$error_log"
+		chunk_failed=0
+		chunk_idx=0
+
+		while [[ $chunk_idx -lt $chunks ]]; do
+			local chunk_start=$(( chunk_idx * rows_per_chunk + 1 ))
+			local chunk_end=$(( chunk_start + rows_per_chunk - 1 ))
+			local chunk_error_log="$ERROR_LOG_DIR/${filename}.chunk${chunk_idx}.error"
+
+			{
+				[[ "${ROCKDBUTIL_SUPPRESS_BINLOG:-0}" == "1" ]] && echo "SET SESSION sql_log_bin = 0;"
+				echo "SET foreign_key_checks = 0;"
+				echo "SET unique_checks = 0;"
+				echo "SET autocommit = 0;"
+				echo "START TRANSACTION;"
+				awk -v header_file="$header_file" \
+					-v start="$chunk_start" \
+					-v end="$chunk_end" \
+					-v total_end="$total_rows" '
+					BEGIN {
+						if ((getline header < header_file) <= 0) header = ""
+						close(header_file)
+						start     = start + 0
+						end       = end + 0
+						total_end = total_end + 0
+						row_num   = 0
+						last_line = ""
+						started   = 0
+					}
+					/^\(/ {
+						row_num++
+						if (row_num < start) next
+						if (row_num > end) exit
+						if (row_num == start) {
+							print header
+							started = 1
+						}
+						if (started && last_line != "") {
+							if (last_line ~ /;[[:space:]]*$/) {
+								print last_line
+								print header
+								last_line = ""
+							} else {
+								print last_line
+							}
+						}
+						last_line = $0
+					}
+					END {
+						if (started && last_line != "") {
+							gsub(/[;,][[:space:]]*$/, "", last_line)
+							print last_line ";"
+						}
+					}
+				' "$sql_file"
+				echo "COMMIT;"
+			} | "$mysql_cmd" --batch --silent -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" 2>"$chunk_error_log"
+
+			if [[ $? -ne 0 ]]; then
+				chunk_failed=$(( chunk_failed + 1 ))
+				cat "$chunk_error_log" >> "$error_log" 2>/dev/null || true
+			fi
+			rm -f "$chunk_error_log"
+			(( chunk_idx++ )) || true
+		done
+
+		if [[ $chunk_failed -eq 0 ]]; then
+			log_success "$table_name: sequential retry succeeded"
+		fi
+	fi
+
+	if [[ $chunk_failed -gt 0 ]]; then
+		local debug_log="$ERROR_LOG_DIR/${filename}.chunk_debug.log"
+		{
+			echo "=== chunk error for $filename ==="
+			echo "--- insert header ---"
+			grep -m 1 "^INSERT INTO" "$sql_file" || true
+			echo "--- mariadb error (last 30 lines) ---"
+			tail -30 "$error_log"
+		} > "$debug_log"
+		echo "FAILED: $filename ($chunk_failed/$chunks chunks failed)" >> "${ERROR_REPORT}.${table_name}"
+		[[ -s "$error_log" ]] && sed 's/^/    /' "$error_log" >> "${ERROR_REPORT}.${table_name}"
+		return 1
+	fi
+
+	echo "$filename" >> "$SUCCESS_LOG"
+	rm -f "$error_log" "$header_file"
+	return 0
+}
+
+# import_single_file - imports a single small table file.
+# Routes large tables (in __large_tables.txt manifest) to the deferred list instead,
+# so they are handled by chunk_import_file after all small tables complete.
+import_single_file() {
+	local sql_file="$1"
+	local filename
+	filename=$(basename "$sql_file")
+	local mysql_cmd="$2"
+	local error_log="$ERROR_LOG_DIR/${filename}.error"
+	local max_retries=3
+	local retry=0
+
+	local manifest="$EXTRACT_DIR/__large_tables.txt"
+	local table_name="${filename%.sql}"
+	if [[ -f "$manifest" ]] && grep -qx "$table_name" "$manifest"; then
+		grep -qxF "$table_name" "$EXTRACT_DIR/__deferred_large.txt" 2>/dev/null || echo "$table_name" >> "$EXTRACT_DIR/__deferred_large.txt"
+		return 0
+	fi
+
+	while [[ $retry -lt $max_retries ]]; do
+		if {
+			[[ "${ROCKDBUTIL_SUPPRESS_BINLOG:-0}" == "1" ]] && echo "SET SESSION sql_log_bin = 0;"
+			cat "$sql_file"
+		} | "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" 2>"$error_log"; then
+			echo "$filename" >> "$SUCCESS_LOG"
+			rm -f "$error_log"
+			[[ $retry -gt 0 ]] && echo "SUCCESS: $filename (after $retry retries)" >&2
+			return 0
+		else
+			((retry++))
+			if grep -q "Lock wait timeout exceeded" "$error_log" && [[ $retry -lt $max_retries ]]; then
+				echo "RETRY $retry/$max_retries: $filename (lock timeout)" >&2
+				sleep $((retry * 2))
+			elif grep -q "Deadlock found" "$error_log" && [[ $retry -lt $max_retries ]]; then
+				echo "RETRY $retry/$max_retries: $filename (deadlock)" >&2
+				sleep $((retry))
+			else
+				break
+			fi
+		fi
+	done
+
+	local retry_text=""
+	[[ $retry -gt 0 ]] && retry_text=" (after $retry retries)"
+	echo "FAILED: $filename$retry_text" >> "$ERROR_REPORT"
+	if [[ -s "$error_log" ]]; then
+		echo "  Error details:" >> "$ERROR_REPORT"
+		sed 's/^/    /' "$error_log" >> "$ERROR_REPORT"
+	fi
+	echo "" >> "$ERROR_REPORT"
+	return 1
+}
+
+# Export worker functions and all globals they depend on.
+# Called once at script load time - both import_database() and selective_restore()
+# rely on these being available in GNU Parallel worker subshells.
+register_worker_exports() {
+	export -f import_single_file chunk_import_file log_progress log_info log_success log_warning log_error log_step
+	export DB_USER DB_PASS DB_NAME ERROR_LOG_DIR ERROR_REPORT SUCCESS_LOG EXTRACT_DIR LARGE_TABLE_CHUNKS
+	export INNODB_FLUSH_LOG_OPT INNODB_DOUBLEWRITE_OPT INNODB_IO_CAPACITY_OPT MAX_CONCURRENT_LARGE_TABLES
+	export ROCKDBUTIL_SUPPRESS_BINLOG
+	export RED GREEN YELLOW BLUE PURPLE CYAN WHITE NC
 }
 
 # === IMPORT FILE RESOLVER ===
@@ -853,6 +1246,9 @@ import_database() {
 	check_command "parallel"
 	check_command "bc"
 	test_db_connection
+
+	# Clean any stale optimization state files from previous interrupted runs.
+	rm -f "$BASE_DIR"/.original_*
 
 	local buffer_info=$(get_optimal_buffer_size)
 	local current_buffer_gb=$(echo "$buffer_info" | cut -d: -f1)
@@ -932,6 +1328,12 @@ import_database() {
 		local file_count=$(find "$EXTRACT_DIR" -name "*.sql" | wc -l)
 		log_success "Split complete - $file_count SQL files ready in extract directory"
 	fi
+
+	if [[ -f "$EXTRACT_DIR/__export_meta.txt" ]]; then
+		cp "$EXTRACT_DIR/__export_meta.txt" "$BASE_DIR/last_export_meta.txt"
+		log_info "Export metadata saved to: $BASE_DIR/last_export_meta.txt"
+	fi
+
 	local sql_files=("$EXTRACT_DIR"/*.sql)
 	if [[ ! -e "${sql_files[0]}" ]]; then
 		log_error "No SQL files found in archive"
@@ -944,303 +1346,7 @@ import_database() {
 	> "$ERROR_REPORT"
 	> "$SUCCESS_LOG"
 
-	# Chunked parallel import for large table files.
-	# Streams the .sql file through awk which splits INSERT rows into N equal chunks,
-	# each chunk piped directly into mariadb - no intermediate chunk files written to disk.
-	# The CREATE TABLE / preamble block is imported once first, then row chunks in parallel.
-	chunk_import_file() {
-		local sql_file="$1"
-		local mysql_cmd="$2"
-		local chunks="$3"
-		local filename=$(basename "$sql_file")
-		local error_log="$ERROR_LOG_DIR/${filename}.chunk.error"
-		local table_name="${filename%.sql}"
-
-		log_progress "Chunked import: $table_name (${chunks} parallel streams)"
-
-		# Step 1: Import the schema block (everything before the first INSERT statement).
-		# Stop at the INSERT INTO line itself - the dump format has INSERT INTO `tbl` VALUES
-		# on its own line followed by data rows starting with (, so it must not include it.
-		awk '/^LOCK TABLES / { exit } { print }' "$sql_file" \
-			| "$mysql_cmd" --batch --silent -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" 2>"$error_log"
-
-		if [[ $? -ne 0 ]]; then
-			echo "FAILED: $filename (schema phase)" >> "${ERROR_REPORT}.${table_name}"
-			[[ -s "$error_log" ]] && sed 's/^/    /' "$error_log" >> "${ERROR_REPORT}.${table_name}"
-			return 1
-		fi
-
-		# Step 2: Extract just the INSERT header line (e.g. INSERT INTO `tbl` VALUES)
-		# and count total data rows so we can divide evenly across chunks.
-		local header_file="$ERROR_LOG_DIR/${filename}.header.tmp"
-		grep -m 1 "^INSERT INTO" "$sql_file" > "$header_file" || true
-
-		if [[ ! -s "$header_file" ]]; then
-			rm -f "$header_file"
-			echo "$filename" >> "$SUCCESS_LOG"
-			return 0
-		fi
-
-		local total_rows
-		local count_file="${sql_file%.sql}.rowcount"
-		if [[ -f "$count_file" ]]; then
-			total_rows=$(cat "$count_file")
-		else
-			total_rows=$(awk '/^\(/ { count++ } END { print count+0 }' "$sql_file" 2>/dev/null || true)
-		fi
-		total_rows="${total_rows:-0}"
-
-		local rows_per_chunk=0
-		if [[ "$total_rows" -gt 0 ]]; then
-			rows_per_chunk=$(( (total_rows + chunks - 1) / chunks ))
-		fi
-
-		if [[ "$rows_per_chunk" -eq 0 ]]; then
-			echo "FAILED: $filename (could not compute chunk size, total_rows=$total_rows)" >> "${ERROR_REPORT}.${table_name}"
-			return 1
-		fi
-
-		# Step 3: Stream each chunk directly into mariadb in parallel.
-		# Each chunk gets its own transaction wrapper to prevent autocommit-mode
-		# row-by-row locking that causes deadlocks between parallel chunk streams.
-		local chunk_pids=()
-		local chunk_errors=()
-		local chunk_idx=0
-
-		while [[ $chunk_idx -lt $chunks ]]; do
-			local chunk_start=$(( chunk_idx * rows_per_chunk + 1 ))
-			local chunk_end=$(( chunk_start + rows_per_chunk - 1 ))
-			echo "DEBUG chunk$chunk_idx: start=$chunk_start end=$chunk_end total=$total_rows rpc=$rows_per_chunk" >> "$ERROR_LOG_DIR/${filename}.debug"
-			local chunk_error_log="$ERROR_LOG_DIR/${filename}.chunk${chunk_idx}.error"
-			chunk_errors+=("$chunk_error_log")
-
-			{
-				echo "SET foreign_key_checks = 0;"
-				echo "SET unique_checks = 0;"
-				echo "SET autocommit = 0;"
-				echo "START TRANSACTION;"
-				awk -v header_file="$header_file" \
-					-v start="$chunk_start" \
-					-v end="$chunk_end" \
-					-v total_end="$total_rows" '
-					BEGIN {
-						if ((getline header < header_file) <= 0) header = ""
-						close(header_file)
-						start     = start + 0
-						end       = end + 0
-						total_end = total_end + 0
-						row_num   = 0
-						last_line = ""
-						started   = 0
-					}
-					/^\(/ {
-						row_num++
-						if (row_num < start) next
-						if (row_num > end) exit
-						if (row_num == start) {
-							print header
-							started = 1
-						}
-						if (started && last_line != "") {
-							if (last_line ~ /;[[:space:]]*$/) {
-								print last_line
-								print header
-								last_line = ""
-							} else {
-								print last_line
-							}
-						}
-						last_line = $0
-					}
-					END {
-					if (started && last_line != "") {
-						gsub(/[;,][[:space:]]*$/, "", last_line)
-						print last_line ";"
-					}
-				}
-			' "$sql_file"
-						echo "COMMIT;"
-					} | "$mysql_cmd" --batch --silent -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" 2>"$chunk_error_log" &
-
-					chunk_pids+=($!)
-					(( chunk_idx++ )) || true
-				done
-
-			# Wait for all parallel chunk imports to complete
-			local chunk_failed=0
-			local pid_idx=0
-			while [[ $pid_idx -lt ${#chunk_pids[@]} ]]; do
-				if ! wait "${chunk_pids[$pid_idx]}"; then
-					chunk_failed=$(( chunk_failed + 1 ))
-					cat "${chunk_errors[$pid_idx]}" >> "$error_log" 2>/dev/null || true
-				fi
-				(( pid_idx++ )) || true
-			done
-
-			# Cleanup per-chunk error logs
-			local i=0
-			while [[ $i -lt ${#chunk_errors[@]} ]]; do
-				rm -f "${chunk_errors[$i]}"
-				(( i++ )) || true
-			done
-
-			# If chunks failed due to lock contention, truncate and retry sequentially.
-			# Parallel inserts on tables with unique/primary key indexes cause deadlocks -
-			# sequential retry eliminates contention while preserving the transaction-size
-			# benefit of chunking. Tables without contention never reach this path.
-			if [[ $chunk_failed -gt 0 ]] && grep -q "Lock wait timeout\|Deadlock" "$error_log" 2>/dev/null; then
-				log_warning "$table_name: lock contention on parallel chunks - truncating and retrying sequentially"
-				"$mysql_cmd" --batch --silent -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
-					-e "SET foreign_key_checks = 0; TRUNCATE TABLE \`${table_name}\`;" 2>/dev/null || true
-				> "$error_log"
-				chunk_failed=0
-				chunk_idx=0
-
-				while [[ $chunk_idx -lt $chunks ]]; do
-					local chunk_start=$(( chunk_idx * rows_per_chunk + 1 ))
-					local chunk_end=$(( chunk_start + rows_per_chunk - 1 ))
-					local chunk_error_log="$ERROR_LOG_DIR/${filename}.chunk${chunk_idx}.error"
-
-					{
-						echo "SET foreign_key_checks = 0;"
-						echo "SET unique_checks = 0;"
-						echo "SET autocommit = 0;"
-						echo "START TRANSACTION;"
-						awk -v header_file="$header_file" \
-							-v start="$chunk_start" \
-							-v end="$chunk_end" \
-							-v total_end="$total_rows" '
-							BEGIN {
-								if ((getline header < header_file) <= 0) header = ""
-								close(header_file)
-								start     = start + 0
-								end       = end + 0
-								total_end = total_end + 0
-								row_num   = 0
-								last_line = ""
-								started   = 0
-							}
-							/^\(/ {
-								row_num++
-								if (row_num < start) next
-								if (row_num > end) exit
-								if (row_num == start) {
-									print header
-									started = 1
-								}
-								if (started && last_line != "") {
-									if (last_line ~ /;[[:space:]]*$/) {
-										print last_line
-										print header
-										last_line = ""
-									} else {
-										print last_line
-									}
-								}
-								last_line = $0
-							}
-							END {
-								if (started && last_line != "") {
-									gsub(/[;,][[:space:]]*$/, "", last_line)
-									print last_line ";"
-								}
-							}
-						' "$sql_file"
-						echo "COMMIT;"
-					} | "$mysql_cmd" --batch --silent -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" 2>"$chunk_error_log"
-
-					if [[ $? -ne 0 ]]; then
-						chunk_failed=$(( chunk_failed + 1 ))
-						cat "$chunk_error_log" >> "$error_log" 2>/dev/null || true
-					fi
-					rm -f "$chunk_error_log"
-					(( chunk_idx++ )) || true
-				done
-
-				if [[ $chunk_failed -eq 0 ]]; then
-					log_success "$table_name: sequential retry succeeded"
-				fi
-			fi
-
-			# On any remaining failure, snapshot the error log for debugging
-			if [[ $chunk_failed -gt 0 ]]; then
-				local debug_log="$ERROR_LOG_DIR/${filename}.chunk_debug.log"
-				{
-					echo "=== chunk error for $filename ==="
-					echo "--- insert header ---"
-					grep -m 1 "^INSERT INTO" "$sql_file" || true
-					echo "--- mariadb error (last 30 lines) ---"
-					tail -30 "$error_log"
-				} > "$debug_log"
-				echo "FAILED: $filename ($chunk_failed/$chunks chunks failed)" >> "${ERROR_REPORT}.${table_name}"
-				[[ -s "$error_log" ]] && sed 's/^/    /' "$error_log" >> "${ERROR_REPORT}.${table_name}"
-				return 1
-			fi
-
-		echo "$filename" >> "$SUCCESS_LOG"
-		rm -f "$error_log" "$header_file"
-		return 0
-	}
-
-	import_single_file() {
-		local sql_file="$1"
-		local filename=$(basename "$sql_file")
-		local mysql_cmd="$2"
-		local error_log="$ERROR_LOG_DIR/${filename}.error"
-		local max_retries=3
-		local retry=0
-
-		# Route large tables through chunked parallel import
-		local manifest="$EXTRACT_DIR/__large_tables.txt"
-		local table_name="${filename%.sql}"
-		if [[ -f "$manifest" ]] && grep -qx "$table_name" "$manifest"; then
-			# Signal that this large table should be deferred - do not import inline.
-			# The main import loop handles large tables after all small tables complete.
-			grep -qxF "$table_name" "$EXTRACT_DIR/__deferred_large.txt" 2>/dev/null || echo "$table_name" >> "$EXTRACT_DIR/__deferred_large.txt"
-			return 0
-		fi
-		
-		while [[ $retry -lt $max_retries ]]; do
-			if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$sql_file" 2>"$error_log"; then
-				echo "$filename" >> "$SUCCESS_LOG"
-				rm -f "$error_log"
-				if [[ $retry -gt 0 ]]; then
-					echo "SUCCESS: $filename (after $retry retries)" >&2
-				fi
-				return 0
-			else
-				((retry++))
-				
-				if grep -q "Lock wait timeout exceeded" "$error_log" && [[ $retry -lt $max_retries ]]; then
-					echo "RETRY $retry/$max_retries: $filename (lock timeout)" >&2
-					sleep $((retry * 2))
-				elif grep -q "Deadlock found" "$error_log" && [[ $retry -lt $max_retries ]]; then
-					echo "RETRY $retry/$max_retries: $filename (deadlock)" >&2
-					sleep $((retry))
-				else
-					break
-				fi
-			fi
-		done
-		
-		local retry_text=""
-		if [[ $retry -gt 0 ]]; then
-			retry_text=" (after $retry retries)"
-		fi
-		
-		echo "FAILED: $filename$retry_text" >> "$ERROR_REPORT"
-		if [[ -s "$error_log" ]]; then
-			echo "  Error details:" >> "$ERROR_REPORT"
-			sed 's/^/    /' "$error_log" >> "$ERROR_REPORT"
-		fi
-		echo "" >> "$ERROR_REPORT"
-		return 1
-	}
-
-	export -f import_single_file chunk_import_file log_progress log_info log_success log_warning log_error log_step
-	export DB_USER DB_PASS DB_NAME ERROR_LOG_DIR ERROR_REPORT SUCCESS_LOG EXTRACT_DIR LARGE_TABLE_CHUNKS
-	export INNODB_FLUSH_LOG_OPT INNODB_DOUBLEWRITE_OPT INNODB_IO_CAPACITY_OPT MAX_CONCURRENT_LARGE_TABLES
-	export RED GREEN YELLOW BLUE PURPLE CYAN WHITE NC
+	register_worker_exports
 
 	# Import sequences first - they are shared across tables and conflict under parallel import.
 	# __sequences.sql is written by sqlsplit when a monolithic .sql.gz is the source.
@@ -1656,6 +1762,471 @@ retry_failed_imports() {
 	return 0
 }
 
+# === FK DEPENDENCY RESOLVER ===
+# Recursively expands a table list to include all Foreign Key (FK) parent tables, up to a depth cap.
+# Prints the expanded list (original + parents) to stdout, one table per line, deduplicated.
+#
+# Args:
+#   $1  - comma-quoted IN list of table names (e.g. 'tbl_a','tbl_b')
+#   $2  - current recursion depth (caller passes 0)
+#
+# Writes to caller-scoped arrays FK_ADDED_TABLES and FK_WARNED_MISSING via temp files
+# rather than subshell vars, because this function is called from selective_restore()
+# which needs to accumulate results across recursive calls.
+resolve_fk_dependencies() {
+	local in_list="$1"
+	local depth="${2:-0}"
+	local max_depth=10
+
+	if [[ "$depth" -ge "$max_depth" ]]; then
+		log_warning "FK resolution reached depth cap ($max_depth levels) - stopping recursion"
+		return 0
+	fi
+
+	local mysql_cmd
+	mysql_cmd=$(get_mysql_command)
+
+	local parents
+	parents=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -sN \
+		-e "SELECT DISTINCT REFERENCED_TABLE_NAME
+		    FROM information_schema.KEY_COLUMN_USAGE
+		    WHERE TABLE_SCHEMA = '${DB_NAME}'
+		    AND TABLE_NAME IN (${in_list})
+		    AND REFERENCED_TABLE_NAME IS NOT NULL;" 2>/dev/null)
+
+	[[ -z "$parents" ]] && return 0
+
+	local new_parents=()
+	local next_in_list_parts=()
+
+	while IFS= read -r parent; do
+		[[ -z "$parent" ]] && continue
+
+		# Skip if already in the known set (tracked in temp file to survive subshells)
+		if grep -qxF "$parent" "$BASE_DIR/.fk_seen_tables" 2>/dev/null; then
+			continue
+		fi
+
+		echo "$parent" >> "$BASE_DIR/.fk_seen_tables"
+		new_parents+=("$parent")
+		next_in_list_parts+=("'${parent}'")
+
+		if [[ -f "$EXTRACT_DIR/${parent}.sql" ]]; then
+			echo "$parent" >> "$BASE_DIR/.fk_added_tables"
+			log_info "FK dependency added: ${parent} (depth $((depth + 1)))"
+		else
+			echo "$parent" >> "$BASE_DIR/.fk_missing_tables"
+			log_warning "FK parent table '${parent}' not found in archive - cannot restore"
+		fi
+	done <<< "$parents"
+
+	if [[ ${#next_in_list_parts[@]} -gt 0 ]]; then
+		local next_in_list
+		next_in_list=$(printf '%s,' "${next_in_list_parts[@]}")
+		next_in_list="${next_in_list%,}"
+		resolve_fk_dependencies "$next_in_list" $((depth + 1))
+	fi
+}
+
+# === SELECTIVE RESTORE ===
+# Restores only a subset of tables from an archive, determined either by binlog scanning
+# (auto mode) or a caller-supplied comma-separated table list (manual mode).
+#
+# After extraction, non-matching .sql files are moved to EXTRACT_DIR/__held/ (never deleted).
+# FK parent tables are resolved recursively and added to the restore set automatically.
+# The existing import pipeline runs unchanged on whatever remains in EXTRACT_DIR.
+#
+# Args:
+#   $1  - archive file path (.tar.gz)
+#   $2  - auto_cleanup (true/false)
+#   $3  - manual tables string (comma-separated, empty string for auto mode)
+selective_restore() {
+	local archive_file="$1"
+	local auto_cleanup="$2"
+	local manual_tables="$3"
+
+	local restore_start_time
+	restore_start_time=$(date +%s)
+
+	if [[ -z "$archive_file" ]]; then
+		log_error "--selective-restore always requires -i <archive>"
+		show_usage
+		exit 1
+	fi
+
+	if [[ ! -f "$archive_file" ]]; then
+		log_error "Archive file not found: $archive_file"
+		exit 1
+	fi
+
+	local binlogparser_path
+	binlogparser_path="$(dirname "$(realpath "$0")")/binlogparser.sh"
+
+	log_step "Starting selective restore.."
+
+	# -- Extract archive (reuse existing logic via import_database prerequisites) --
+	check_command "parallel"
+	check_command "bc"
+	test_db_connection
+
+	# Clean any stale optimization state files from previous interrupted runs.
+	# If left behind they cause restore_import_optimizations to write back wrong values.
+	rm -f "$BASE_DIR"/.original_*
+
+	setup_directories
+	if [[ -d "$EXTRACT_DIR" ]] && [[ "$(ls -A "$EXTRACT_DIR" 2>/dev/null)" ]]; then
+		log_warning "Extract directory contains files. Removing old files.."
+		rm -rf "$EXTRACT_DIR"/*
+	fi
+	rm -rf "$ERROR_LOG_DIR"/*
+
+	IMPORT_TYPE=""
+	resolve_import_file "$archive_file"
+
+	if [[ "$IMPORT_TYPE" == "archive" ]]; then
+		log_step "Extracting archive: $archive_file"
+		if tar -xzf "$archive_file" -C "$EXTRACT_DIR" 2>/dev/null; then
+			local extracted_count
+			extracted_count=$(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql" | wc -l)
+			log_success "Extracted $extracted_count table SQL files"
+		else
+			log_error "Failed to extract archive"
+			exit 1
+		fi
+	else
+		local extracted_count
+		extracted_count=$(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql" | wc -l)
+		log_success "Split complete - $extracted_count SQL files ready"
+	fi
+
+	if [[ -f "$EXTRACT_DIR/__export_meta.txt" ]]; then
+		cp "$EXTRACT_DIR/__export_meta.txt" "$BASE_DIR/last_export_meta.txt"
+		log_info "Export metadata saved to: $BASE_DIR/last_export_meta.txt"
+	fi
+
+	# -- Build restore table list --
+	local restore_tables=()
+
+	if [[ -n "$manual_tables" ]]; then
+		log_step "Manual mode - using supplied table list"
+		IFS=',' read -ra restore_tables <<< "$manual_tables"
+		restore_tables=("${restore_tables[@]// /}")
+	else
+		log_step "Auto mode - scanning binlog for changed tables.."
+
+		local meta_file="$BASE_DIR/last_export_meta.txt"
+		if [[ ! -f "$meta_file" ]]; then
+			log_error "No export metadata found at: $meta_file"
+			log_info "Run a full export first, or supply --tables for manual mode"
+			exit 1
+		fi
+
+		if [[ ! -f "$binlogparser_path" ]]; then
+			log_error "binlogparser.sh not found at: $binlogparser_path"
+			log_info "Place binlogparser.sh in the same directory as rockdbutil.sh"
+			exit 1
+		fi
+
+		if [[ ! -x "$binlogparser_path" ]]; then
+			log_error "binlogparser.sh is not executable: $binlogparser_path"
+			log_info "Run: chmod +x $binlogparser_path"
+			exit 1
+		fi
+
+		local binlog_output
+		binlog_output=$(bash "$binlogparser_path" \
+			--from-export "$meta_file" \
+			--db-name "$DB_NAME" \
+			-db "$CURRENT_DB_PROFILE" 2>/dev/null \
+			| grep -v '^$' || true)
+
+		if [[ -z "$binlog_output" ]]; then
+			log_warning "Binlog scan found no changed tables since last export"
+			log_info "Nothing to restore - exiting"
+			exit 0
+		fi
+
+		while IFS= read -r entry; do
+			[[ -z "$entry" ]] && continue
+			local tbl="${entry##*.}"
+			restore_tables+=("$tbl")
+		done <<< "$binlog_output"
+
+		log_success "Binlog scan found ${#restore_tables[@]} changed table(s)"
+	fi
+
+	if [[ ${#restore_tables[@]} -eq 0 ]]; then
+		log_error "Restore table list is empty"
+		exit 1
+	fi
+
+	# -- FK dependency resolution --
+	log_step "Resolving FK dependencies.."
+
+	rm -f "$BASE_DIR/.fk_seen_tables" "$BASE_DIR/.fk_added_tables" "$BASE_DIR/.fk_missing_tables"
+
+	# Seed seen file with the initial restore set so parents-of-initial-tables are still found
+	# but the initial tables themselves are not double-added
+	printf '%s\n' "${restore_tables[@]}" > "$BASE_DIR/.fk_seen_tables"
+
+	local in_list_parts=()
+	local tbl
+	for tbl in "${restore_tables[@]}"; do
+		in_list_parts+=("'${tbl}'")
+	done
+	local in_list
+	in_list=$(printf '%s,' "${in_list_parts[@]}")
+	in_list="${in_list%,}"
+
+	resolve_fk_dependencies "$in_list" 0
+
+	local fk_added=()
+	if [[ -f "$BASE_DIR/.fk_added_tables" ]]; then
+		while IFS= read -r t; do
+			[[ -n "$t" ]] && fk_added+=("$t")
+		done < "$BASE_DIR/.fk_added_tables"
+	fi
+
+	local final_restore_tables=("${restore_tables[@]}" "${fk_added[@]}")
+
+	rm -f "$BASE_DIR/.fk_seen_tables" "$BASE_DIR/.fk_added_tables"
+
+	# -- Estimate full import size for summary comparison --
+	local total_archive_bytes=0
+	local restore_archive_bytes=0
+	local restore_set_lookup
+	restore_set_lookup=$(printf '\n%s' "${final_restore_tables[@]}")
+
+	while IFS= read -r sql_file; do
+		local file_bytes
+		file_bytes=$(stat -c%s "$sql_file" 2>/dev/null || echo 0)
+		total_archive_bytes=$((total_archive_bytes + file_bytes))
+		local tname
+		tname=$(basename "$sql_file" .sql)
+		if echo "$restore_set_lookup" | grep -qxF "$tname"; then
+			restore_archive_bytes=$((restore_archive_bytes + file_bytes))
+		fi
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql")
+
+	# -- Move non-restore tables to __held/ --
+	local held_dir="$EXTRACT_DIR/__held"
+	mkdir -p "$held_dir"
+
+	local skipped_tables=()
+
+	while IFS= read -r sql_file; do
+		local tname
+		tname=$(basename "$sql_file" .sql)
+		if ! echo "$restore_set_lookup" | grep -qxF "$tname"; then
+			mv "$sql_file" "$held_dir/"
+			skipped_tables+=("$tname")
+		fi
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql")
+
+	local restore_count=${#final_restore_tables[@]}
+	local skipped_count=${#skipped_tables[@]}
+
+	log_success "Restore set: $restore_count table(s) | Held: $skipped_count table(s)"
+
+	# Regenerate the large table manifest for the restore set.
+	# The manifest is written by sqlsplit during .sql.gz splits but is never packed into
+	# .tar.gz archives - selective restore must rebuild it from file sizes so that
+	# import_single_file correctly defers large tables to chunk_import_file.
+	local manifest_file="$EXTRACT_DIR/__large_tables.txt"
+	rm -f "$manifest_file"
+	while IFS= read -r sql_file; do
+		local file_bytes
+		file_bytes=$(stat -c%s "$sql_file" 2>/dev/null || echo 0)
+		local file_mb=$(( file_bytes / 1048576 ))
+		if [[ $file_mb -ge $LARGE_TABLE_THRESHOLD_MB ]]; then
+			basename "$sql_file" .sql >> "$manifest_file"
+		fi
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql")
+
+	if [[ -f "$manifest_file" ]]; then
+		local large_count
+		large_count=$(wc -l < "$manifest_file")
+		log_info "Large tables in restore set flagged for chunked import: $large_count (>${LARGE_TABLE_THRESHOLD_MB}MB)"
+	fi
+
+	# -- Run existing import pipeline --
+	log_step "Running import pipeline on selective restore set.."
+
+	local buffer_info
+	buffer_info=$(get_optimal_buffer_size)
+	local current_buffer_gb
+	current_buffer_gb=$(echo "$buffer_info" | cut -d: -f1)
+	local suggested_buffer_gb
+	suggested_buffer_gb=$(echo "$buffer_info" | cut -d: -f2)
+	local total_ram_gb
+	total_ram_gb=$(echo "$buffer_info" | cut -d: -f3)
+
+	local use_buffer_optimization=false
+	local cleanup_buffer=false
+	trap 'if [[ "${cleanup_buffer:-false}" == "true" ]]; then restore_import_optimizations; fi' EXIT
+
+	if [[ $(echo "$suggested_buffer_gb > $current_buffer_gb" | bc 2>/dev/null) == "1" ]]; then
+		if [[ "$auto_cleanup" == "true" ]]; then
+			if apply_import_optimizations "$suggested_buffer_gb"; then
+				use_buffer_optimization=true
+				cleanup_buffer=true
+			fi
+		else
+			read -p "$(echo -e "${YELLOW}Temporarily increase buffer pool to ${suggested_buffer_gb}GB? [Y/n]:${NC} ")" -n 1 -r
+			echo
+			if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+				if apply_import_optimizations "$suggested_buffer_gb"; then
+					use_buffer_optimization=true
+					cleanup_buffer=true
+				fi
+			fi
+		fi
+	fi
+
+	local mysql_cmd
+	mysql_cmd=$(get_mysql_command)
+	local threads
+	threads=$(get_thread_count)
+	log_info "Using $threads parallel threads"
+
+	> "$ERROR_REPORT"
+	> "$SUCCESS_LOG"
+
+	register_worker_exports
+
+	local sequences_file="$EXTRACT_DIR/__sequences.sql"
+	if [[ -f "$sequences_file" && -s "$sequences_file" ]]; then
+		log_step "Importing sequences (pre-import step).."
+		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$sequences_file" \
+			2>"$ERROR_LOG_DIR/__sequences.error"; then
+			log_success "Sequences imported"
+			rm -f "$ERROR_LOG_DIR/__sequences.error"
+		else
+			log_warning "Sequence import had errors (may be harmless if sequences already exist)"
+		fi
+	fi
+
+	local total_files
+	total_files=$(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql" | wc -l)
+
+	local sql_file_list=()
+	while IFS= read -r -d '' f; do
+		sql_file_list+=("$f")
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql" -print0)
+
+	parallel -j "$threads" import_single_file {} "$mysql_cmd" ::: "${sql_file_list[@]}" || true
+
+	local deferred_file="$EXTRACT_DIR/__deferred_large.txt"
+	if [[ -f "$deferred_file" && -s "$deferred_file" ]]; then
+		log_info "Pre-computing row counts for large tables.."
+		while IFS= read -r table_name; do
+			local sql_file="$EXTRACT_DIR/${table_name}.sql"
+			awk '/^\(/ { count++ } END { print count+0 }' "$sql_file" \
+				> "$EXTRACT_DIR/${table_name}.rowcount" &
+		done < "$deferred_file"
+		wait
+
+		log_step "Importing large tables (${MAX_CONCURRENT_LARGE_TABLES} concurrent, ${LARGE_TABLE_CHUNKS} streams each).."
+		local large_pids=()
+		local running=0
+
+		while IFS= read -r table_name; do
+			local sql_file="$EXTRACT_DIR/${table_name}.sql"
+			chunk_import_file "$sql_file" "$mysql_cmd" "$LARGE_TABLE_CHUNKS" &
+			large_pids+=($!)
+			running=$((running + 1))
+
+			if [[ $running -ge $MAX_CONCURRENT_LARGE_TABLES ]]; then
+				wait "${large_pids[0]}" || true
+				large_pids=("${large_pids[@]:1}")
+				running=$((running - 1))
+			fi
+		done < "$deferred_file"
+
+		local p
+		for p in "${large_pids[@]}"; do
+			wait "$p" || true
+		done
+	fi
+
+	if grep -q "^FAILED:" "$ERROR_REPORT" 2>/dev/null; then
+		log_warning "Some imports failed - retrying sequentially.."
+		retry_failed_imports "$mysql_cmd" || true
+	fi
+
+	if [[ "$use_buffer_optimization" == "true" ]]; then
+		restore_import_optimizations
+	fi
+
+	# -- Restore or discard held files --
+	if [[ "$auto_cleanup" == "true" ]]; then
+		rm -rf "$held_dir"
+		rm -rf "$EXTRACT_DIR"/*
+		rm -f "$ERROR_REPORT" "$SUCCESS_LOG"
+		rm -rf "$ERROR_LOG_DIR"/*
+		log_success "Held files discarded (--auto-cleanup)"
+	else
+		find "$held_dir" -maxdepth 1 -name "*.sql" -exec mv {} "$EXTRACT_DIR/" \;
+		rmdir "$held_dir" 2>/dev/null || true
+		log_info "Held files restored to: $EXTRACT_DIR"
+	fi
+
+	# -- Advance the binlog baseline to now so the next selective restore only sees new changes --
+	local mysql_cmd_pos
+	mysql_cmd_pos=$(get_mysql_command)
+	local new_master_status
+	new_master_status=$("$mysql_cmd_pos" -u "$DB_USER" -p"$DB_PASS" -sN \
+		-e "SHOW MASTER STATUS;" 2>/dev/null | head -1)
+
+	if [[ -n "$new_master_status" ]]; then
+		local new_binlog_file new_binlog_position
+		new_binlog_file=$(echo "$new_master_status" | awk '{print $1}')
+		new_binlog_position=$(echo "$new_master_status" | awk '{print $2}')
+		cat > "$BASE_DIR/last_export_meta.txt" <<EOF
+binlog_file=${new_binlog_file}
+binlog_position=${new_binlog_position}
+export_timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+db_name=${DB_NAME}
+rockdbutil_version=1.0
+EOF
+		log_info "Binlog baseline advanced to: ${new_binlog_file}:${new_binlog_position}"
+	else
+		log_warning "Could not advance binlog baseline - next selective restore may re-restore these tables"
+	fi
+
+	rm -f "$BASE_DIR/.fk_missing_tables"
+
+	# -- Summary output --
+	local restore_end_time
+	restore_end_time=$(date +%s)
+	local duration=$((restore_end_time - restore_start_time))
+	local minutes=$((duration / 60))
+	local seconds=$((duration % 60))
+
+	local total_mb=$(( (total_archive_bytes + 524288) / 1048576 ))
+	local restore_mb=$(( (restore_archive_bytes + 524288) / 1048576 ))
+	local skipped_mb=$(( total_mb - restore_mb ))
+
+	echo
+	echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
+	echo -e "${GREEN}║           Selective restore completed                ║${NC}"
+	echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
+	echo -e "  Database        : ${WHITE}$DB_NAME${NC}"
+	echo -e "  Restored        : ${WHITE}$restore_count table(s) (${restore_mb}MB)${NC}"
+	if [[ ${#fk_added[@]} -gt 0 ]]; then
+		echo -e "  FK deps added   : ${WHITE}${#fk_added[@]} table(s): $(printf '%s ' "${fk_added[@]}")${NC}"
+	fi
+	echo -e "  Skipped         : ${WHITE}$skipped_count table(s) (${skipped_mb}MB held)${NC}"
+	echo -e "  Duration        : ${WHITE}${minutes}m ${seconds}s${NC}"
+	if [[ -f "$BASE_DIR/.fk_missing_tables" ]]; then
+		echo -e "  ${YELLOW}FK parents missing from archive:${NC}"
+		while IFS= read -r missing; do
+			echo -e "    ${YELLOW}• $missing${NC}"
+		done < "$BASE_DIR/.fk_missing_tables"
+	fi
+	echo
+}
+
 # === USAGE FUNCTION ===
 show_usage() {
 	echo -e "${WHITE}rockdbutil - MariaDB/MySQL Import/Export Tool${NC}"
@@ -1723,6 +2294,7 @@ main() {
 	local database_profile="default"
 	local command=""
 	local archive_file=""
+	local selective_tables=""
 	
 	while [[ $# -gt 0 ]]; do
 		case $1 in
@@ -1739,8 +2311,8 @@ main() {
 				shift
 				;;
 			-i|import)
-				command="import"
 				archive_file="$2"
+				[[ "$command" != "selective-restore" ]] && command="import"
 				shift 2
 				;;
 			--setup|setup)
@@ -1770,6 +2342,14 @@ main() {
 			--test-import-buffer)
 				command="test-import-buffer"
 				archive_file="$2"
+				shift 2
+				;;
+			--selective-restore)
+				command="selective-restore"
+				shift
+				;;
+			--tables)
+				selective_tables="$2"
 				shift 2
 				;;
 			*)
@@ -1817,6 +2397,9 @@ main() {
 			;;
 		test-import-buffer)
 			test_import_with_buffer_optimization "$archive_file"
+			;;
+		selective-restore)
+			selective_restore "$archive_file" "$auto_cleanup" "$selective_tables"
 			;;
 		help|"")
 			show_usage
