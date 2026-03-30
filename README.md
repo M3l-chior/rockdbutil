@@ -18,37 +18,149 @@ Fast, reliable MariaDB/MySQL import/export tool with parallel processing, large-
 
 ## Quick Start
 
+Everything you need to go from zero to a working import in one pass. Do these steps in order.
+
+---
+
+### Step 1 - Configure MariaDB (`my.cnf`)
+
+rockdbutil needs binlog enabled in ROW format to support selective restore. 
+Add the following to your MariaDB config under `[mysqld]` if it isn't already there:
+
+```ini
+[mysqld]
+log_bin = /var/log/mysql/mariadb-bin
+binlog_format = ROW
+expire_logs_days = 7
+max_binlog_size = 100M
+```
+
+Restart MariaDB after editing:
 ```bash
-# Download all three scripts (keep them in the same directory)
+# Arch / Manjaro
+sudo systemctl restart mariadb
+
+# Ubuntu / Debian
+sudo systemctl restart mysql
+```
+
+> If you only need basic import/export and don't need selective restore, you can skip this step. All other features work without binlog.
+
+---
+
+### Step 2 - Grant database privileges
+
+Connect to MariaDB as root and run all of the following for your import user:
+
+```sql
+-- Standard import/export operations
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER,
+      LOCK TABLES, SHOW VIEW, EVENT, TRIGGER ON *.* TO 'your_user'@'localhost';
+
+-- InnoDB optimizations during import (buffer pool, flush log, doublewrite, I/O capacity)
+GRANT SUPER ON *.* TO 'your_user'@'localhost';
+
+-- Binlog reading and suppression (required for selective restore)
+GRANT REPLICATION CLIENT, REPLICATION SLAVE, BINLOG ADMIN ON *.* TO 'your_user'@'localhost';
+
+FLUSH PRIVILEGES;
+```
+
+Replace `your_user` with your actual MariaDB username. 
+If you already have `ALL PRIVILEGES` on the target database, you still need the `*.*` grants above - `SUPER` and `BINLOG ADMIN` cannot be granted per-database.
+
+---
+
+### Step 3 - Download the scripts
+
+```bash
 wget https://raw.githubusercontent.com/M3l-chior/rockdbutil/main/rockdbutil.sh
 wget https://raw.githubusercontent.com/M3l-chior/rockdbutil/main/sqlsplit.sh
 wget https://raw.githubusercontent.com/M3l-chior/rockdbutil/main/binlogparser.sh
 chmod +x rockdbutil.sh sqlsplit.sh binlogparser.sh
-
-# Setup (first time only - creates config file and directories)
-./rockdbutil.sh --setup
-
-# Configure - set your database credentials
-vim ~/.config/rockdbutil.conf
-
-# Export database (default profile) - records binlog position for selective restore
-./rockdbutil.sh -e
-
-# Export using a named profile
-./rockdbutil.sh -e -db production
-
-# Import a rockdbutil export (default profile)
-./rockdbutil.sh -i db_dump_mydb_20231201_143022.tar.gz
-
-# Import a monolithic mysqldump / mariadb-dump (.sql.gz)
-./rockdbutil.sh -i db_backup.sql.gz
-
-# Import to a named profile
-./rockdbutil.sh -i db_dump_mydb_20231201_143022.tar.gz -db staging
-
-# Selective restore - only tables changed since last export
-./rockdbutil.sh --selective-restore -i db_dump_mydb_20231201_143022.tar.gz -db staging
 ```
+
+Keep all three scripts in the same directory - they call each other by relative path.
+
+---
+
+### Step 4 - Run setup
+
+```bash
+./rockdbutil.sh --setup
+```
+
+This creates `~/.config/rockdbutil.conf` and the working directories under `~/database_operations/`.
+
+---
+
+### Step 5 - Edit the config
+
+```bash
+vim ~/.config/rockdbutil.conf
+```
+
+At minimum, set your default database credentials:
+
+```bash
+default_db_name=your_database
+default_db_user=your_user
+default_db_pass=your_password
+default_db_host=localhost
+default_db_port=3306
+```
+
+For multiple databases, add named profiles - see [Configuration](#configuration) for the full reference.
+
+**Recommended tuning for NVMe / 16-core systems:**
+```bash
+large_table_threshold_mb=200
+large_table_chunks=4
+max_concurrent_large_tables=6
+thread_mode=max
+```
+
+---
+
+### Step 6 - Test the connection
+
+```bash
+./rockdbutil.sh --test-connection
+```
+
+---
+
+### Step 7 - Import or export
+
+**Import a dump:**
+```bash
+# From a previous rockdbutil export
+./rockdbutil.sh -i db_dump_mydb_20260330.tar.gz -db your_profile
+
+# From a raw mysqldump / mariadb-dump
+./rockdbutil.sh -i db_backup.sql.gz -db your_profile
+```
+
+**Export your database:**
+```bash
+./rockdbutil.sh -e -db your_profile
+```
+
+The export records the current binlog position - this is the baseline for selective restore.
+
+---
+
+### Step 8 - Selective restore (after making changes)
+
+Once you've exported a baseline, made changes to the database via your app, and want to revert only those changes:
+
+```bash
+./rockdbutil.sh --selective-restore -i db_dump_mydb_20260330.tar.gz -db your_profile
+```
+
+rockdbutil scans the binlog from the export position, finds only the tables that changed, and restores just those. See [Selective Restore](#selective-restore) for the full workflow.
+
+---
 
 ## Prerequisites
 
