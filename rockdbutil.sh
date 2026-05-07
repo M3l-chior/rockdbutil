@@ -36,6 +36,9 @@ MAX_CONCURRENT_LARGE_TABLES=2
 INNODB_FLUSH_LOG_OPT=true
 INNODB_DOUBLEWRITE_OPT=true
 INNODB_IO_CAPACITY_OPT=true
+EXPORT_FORMAT="csv"
+CSV_OUTFILE_DIR=""
+CSV_LOAD_MODE=""
 
 # === LOGGING FUNCTIONS ===
 log_info() {
@@ -60,6 +63,21 @@ log_step() {
 
 log_progress() {
 	echo -e "${CYAN}[PROGRESS]${NC} $1"
+}
+
+format_duration() {
+	local total_seconds="$1"
+	local minutes=$(( total_seconds / 60 ))
+	local seconds=$(( total_seconds % 60 ))
+	printf "%dm %ds" "$minutes" "$seconds"
+}
+
+log_timed_success() {
+	local label="$1"
+	local start_ts="$2"
+	local end_ts
+	end_ts=$(date +%s)
+	log_success "$label ($(format_duration $(( end_ts - start_ts ))))"
 }
 
 # === CONFIGURATION ===
@@ -278,6 +296,17 @@ innodb_io_capacity_opt=true
 
 # If auto_cleanup is false, it will retain the temp files unless if you supply the -d flag.
 # if it is true, it will always remove the temp files.
+
+# Export format (csv is default - significantly faster than sql at scale)
+# Use --sql flag at runtime to force SQL export for a single run instead of changing this.
+# csv  - exports schema as .schema.sql + data as .csv via SELECT INTO OUTFILE (default)
+# sql  - exports full per-table .sql files via mysqldump (legacy behaviour)
+export_format=csv
+
+# Directory used by MariaDB server for SELECT INTO OUTFILE during CSV export.
+# Must be writable by the MariaDB process. Defaults to base_directory/csv_export.
+# If secure_file_priv is set on the server, this path must be within that restricted path.
+csv_outfile_dir=
 EOF
 
 	chmod 600 "$CONFIG_FILE"
@@ -365,6 +394,22 @@ load_database_config() {
 		ERROR_LOG_DIR="$BASE_DIR/logs"
 		ERROR_REPORT="$BASE_DIR/error_report.txt"
 		SUCCESS_LOG="$BASE_DIR/success_log.txt"
+	fi
+
+	local export_format_config
+	export_format_config=$(grep "^export_format=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d '"' | tr -d "'" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+	if [[ "$export_format_config" == "sql" ]]; then
+		EXPORT_FORMAT="sql"
+	else
+		EXPORT_FORMAT="csv"
+	fi
+
+	local csv_outfile_dir_config
+	csv_outfile_dir_config=$(grep "^csv_outfile_dir=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"' | tr -d "'" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+	if [[ -n "$csv_outfile_dir_config" ]]; then
+		CSV_OUTFILE_DIR="${csv_outfile_dir_config/#\$HOME/$HOME}"
+	else
+		CSV_OUTFILE_DIR="$BASE_DIR/csv_export"
 	fi
 	
 	if [[ -n "$DB_HOST" && "$DB_HOST" != "localhost" ]]; then
@@ -535,6 +580,21 @@ apply_import_optimizations() {
 	echo "$current_lock_wait" > "$BASE_DIR/.original_lock_wait_timeout"
 	"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" \
 		-e "SET GLOBAL innodb_lock_wait_timeout = 600;" 2>/dev/null || true
+
+	# Bump max_allowed_packet to 1GB for the duration of import.
+	# LOAD DATA LOCAL INFILE sends file data in packets - the default 16MB limit
+	# silently truncates large CSV loads after the first packet boundary.
+	local current_max_packet
+	current_max_packet=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -sN \
+		-e "SELECT @@GLOBAL.max_allowed_packet;" 2>/dev/null)
+	echo "${current_max_packet:-16777216}" > "$BASE_DIR/.original_max_allowed_packet"
+	if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" \
+			-e "SET GLOBAL max_allowed_packet = 1073741824;" 2>/dev/null; then
+		log_success "max_allowed_packet set to 1GB (large CSV load support)"
+	else
+		log_warning "Could not set max_allowed_packet - large CSV loads may truncate"
+		rm -f "$BASE_DIR/.original_max_allowed_packet"
+	fi
 
 	local current_buffer_bytes
 	current_buffer_bytes=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -sN \
@@ -755,6 +815,20 @@ restore_import_optimizations() {
 		fi
 		rm -f "$slow_log_file"
 	fi
+
+	local max_packet_file="$BASE_DIR/.original_max_allowed_packet"
+	if [[ -f "$max_packet_file" ]]; then
+		local original_max_packet
+		original_max_packet=$(cat "$max_packet_file")
+		log_info "Restoring max_allowed_packet to $original_max_packet"
+		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" \
+			-e "SET GLOBAL max_allowed_packet = $original_max_packet;" 2>/dev/null; then
+			log_success "max_allowed_packet restored"
+		else
+			log_warning "Failed to restore max_allowed_packet"
+		fi
+		rm -f "$max_packet_file"
+	fi
 }
 
 setup_directories() {
@@ -766,70 +840,222 @@ setup_directories() {
 	mkdir -p "$DUMP_DIR"
 	mkdir -p "$EXTRACT_DIR"
 	mkdir -p "$ERROR_LOG_DIR"
+	[[ -n "$CSV_OUTFILE_DIR" ]] && mkdir -p "$CSV_OUTFILE_DIR"
+}
+
+# === CSV HELPER FUNCTIONS ===
+
+# check_secure_file_priv - queries the server's secure_file_priv setting to determine
+# which LOAD DATA / INTO OUTFILE mode is available.
+#
+# Sets global CSV_LOAD_MODE to one of:
+#   server   - secure_file_priv is empty (unrestricted) or csv_outfile_dir is within the allowed path
+#   local    - secure_file_priv is NULL (server-side disabled); fall back to LOCAL INFILE
+#   disabled - neither path is viable; CSV export cannot proceed
+#
+# Also validates that csv_outfile_dir is within the secure_file_priv path when restricted.
+check_secure_file_priv() {
+	local mysql_cmd
+	mysql_cmd=$(get_mysql_command)
+
+	local sfp_value
+	sfp_value=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+		-sN -e "SELECT @@GLOBAL.secure_file_priv;" 2>/dev/null)
+
+	if [[ -z "$sfp_value" ]]; then
+		log_info "secure_file_priv: unrestricted - server-side CSV export enabled"
+		CSV_LOAD_MODE="server"
+		return 0
+	fi
+
+	if [[ "$sfp_value" == "NULL" ]]; then
+		log_warning "secure_file_priv=NULL - server-side SELECT INTO OUTFILE is disabled"
+		local local_infile
+		local_infile=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			-sN -e "SELECT @@GLOBAL.local_infile;" 2>/dev/null)
+		if [[ "$local_infile" == "1" ]]; then
+			log_info "local_infile=ON - will use LOAD DATA LOCAL INFILE fallback"
+			CSV_LOAD_MODE="local"
+		else
+			log_warning "local_infile=OFF and secure_file_priv=NULL - CSV export not available"
+			log_info "Enable with: SET GLOBAL local_infile = 1;"
+			log_info "Or remove secure_file_priv restriction in server config"
+			CSV_LOAD_MODE="disabled"
+		fi
+		return 0
+	fi
+
+	# Specific path restriction - verify csv_outfile_dir is within the allowed path
+	local sfp_real
+	sfp_real=$(realpath "$sfp_value" 2>/dev/null || echo "$sfp_value")
+	local csv_real
+	csv_real=$(realpath "$CSV_OUTFILE_DIR" 2>/dev/null || echo "$CSV_OUTFILE_DIR")
+
+	if [[ "$csv_real" == "$sfp_real"* ]]; then
+		log_info "secure_file_priv=$sfp_value - csv_outfile_dir is within allowed path"
+		CSV_LOAD_MODE="server"
+	else
+		log_warning "secure_file_priv=$sfp_value restricts outfile to that path"
+		log_warning "csv_outfile_dir ($CSV_OUTFILE_DIR) is outside the allowed path"
+		log_info "Update csv_outfile_dir in config to a path within: $sfp_value"
+
+		local local_infile
+		local_infile=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			-sN -e "SELECT @@GLOBAL.local_infile;" 2>/dev/null)
+		if [[ "$local_infile" == "1" ]]; then
+			log_info "local_infile=ON - falling back to LOAD DATA LOCAL INFILE"
+			CSV_LOAD_MODE="local"
+		else
+			CSV_LOAD_MODE="disabled"
+		fi
+	fi
+}
+
+# detect_blob_tables - queries information_schema for any columns with blob/binary types
+# in the target database. Tables with these types cannot be safely exported as CSV and
+# must fall back to SQL export.
+#
+# Outputs a newline-separated list of affected table names to stdout (empty if none found).
+detect_blob_tables() {
+	local mysql_cmd
+	mysql_cmd=$(get_mysql_command)
+
+	"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+		-sN -e "
+			SELECT DISTINCT TABLE_NAME
+			FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = '${DB_NAME}'
+			AND DATA_TYPE IN ('blob','mediumblob','longblob','tinyblob','binary','varbinary')
+			ORDER BY TABLE_NAME;
+		" 2>/dev/null
+}
+
+# export_table_schema - exports DDL only for a single table using mysqldump --no-data.
+# Produces tablename.schema.sql in DUMP_DIR.
+#
+# Args:
+#   $1 - table name
+#   $2 - mysqldump command (mariadb-dump or mysqldump)
+export_table_schema() {
+	local table="$1"
+	local mysqldump_cmd="$2"
+
+	"$mysqldump_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+		--single-transaction --skip-lock-tables --no-data \
+		--skip-triggers \
+		"$DB_NAME" "$table" > "$DUMP_DIR/${table}.schema.sql" 2>/dev/null
+}
+
+# export_table_csv - exports table data as CSV.
+#
+# Two modes depending on CSV_LOAD_MODE:
+#   server - uses SELECT INTO OUTFILE (server writes file to CSV_OUTFILE_DIR, moved to DUMP_DIR)
+#   local  - uses mysql --batch --silent to write tab-separated data client-side.
+#            Tab-separated with \N for NULLs matches LOAD DATA LOCAL INFILE natively -
+#            no awk conversion needed, which keeps export speed comparable to mysqldump.
+#
+# Args:
+#   $1 - table name
+#   $2 - mysql client command (mariadb or mysql)
+export_table_csv() {
+	local table="$1"
+	local mysql_cmd="$2"
+	local dest="$DUMP_DIR/${table}.csv"
+
+	if [[ "$CSV_LOAD_MODE" == "local" ]]; then
+		"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			--batch --silent --skip-column-names \
+			"$DB_NAME" -e "SELECT * FROM \`${table}\`;" 2>/dev/null > "$dest"
+	else
+		local outfile="$CSV_OUTFILE_DIR/${table}.csv"
+		rm -f "$outfile"
+
+		"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			"$DB_NAME" -e "
+				SELECT * FROM \`${table}\`
+				INTO OUTFILE '${outfile}'
+				FIELDS TERMINATED BY ','
+				OPTIONALLY ENCLOSED BY '\"'
+				ESCAPED BY '\\\\'
+				LINES TERMINATED BY '\n';
+			" 2>/dev/null
+
+		if [[ ! -f "$outfile" ]]; then
+			log_warning "CSV export produced no file for table: $table"
+			return 1
+		fi
+
+		mv "$outfile" "$dest"
+	fi
+
+	if [[ ! -f "$dest" ]]; then
+		log_warning "CSV export produced no file for table: $table"
+		return 1
+	fi
 }
 
 # === EXPORT FUNCTION ===
 export_database() {
 	local auto_cleanup="$1"
-	
+
 	log_step "Starting database export process.."
-	
+
 	check_command "parallel"
 	check_command "tar"
 	check_command "gzip"
 	test_db_connection
 
 	ARCHIVE_NAME="db_dump_${DB_NAME}_${TIMESTAMP}.tar.gz"
-	
-	local mysql_cmd=$(get_mysql_command)
-	local mysqldump_cmd=$(get_mysqldump_command)
-	
+
+	local mysql_cmd
+	mysql_cmd=$(get_mysql_command)
+	local mysqldump_cmd
+	mysqldump_cmd=$(get_mysqldump_command)
+
 	setup_directories
 	if [[ -d "$DUMP_DIR" ]] && [[ "$(ls -A "$DUMP_DIR" 2>/dev/null)" ]]; then
 		log_warning "Dump directory contains files. Removing old files.."
 		rm -rf "$DUMP_DIR"/*
 	fi
 	log_success "Using dump directory: $DUMP_DIR"
-	
+
 	log_info "Retrieving table list from database: $DB_NAME"
 	local tables
-	if ! tables=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -e "SHOW TABLES IN \`$DB_NAME\`;" 2>/dev/null | tail -n +2); then
+	if ! tables=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" \
+			$MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			-e "SHOW TABLES IN \`$DB_NAME\`;" 2>/dev/null | tail -n +2); then
 		log_error "Failed to retrieve table list from database: $DB_NAME"
 		exit 1
 	fi
-	
+
 	if [[ -z "$tables" ]]; then
 		log_error "No tables found in database: $DB_NAME"
 		exit 1
 	fi
-	
-	local table_count=$(echo "$tables" | wc -l)
-	log_success "Found $table_count tables to export"
-	local exported=0
-	
-	log_step "Exporting tables..."
-	while IFS= read -r table; do
-		[[ -z "$table" ]] && continue
-		log_progress "Dumping table: $table"
-		if "$mysqldump_cmd" -u "$DB_USER" -p"$DB_PASS" \
-			--single-transaction --skip-lock-tables \
-			"$DB_NAME" "$table" > "$DUMP_DIR/$table.sql" 2>/dev/null; then
-			exported=$((exported + 1))
-		else
-			log_warning "Failed to dump table: $table"
-		fi
-	done <<< "$tables"
 
-	log_success "Successfully exported $exported/$table_count tables"
+	local table_count
+	table_count=$(echo "$tables" | wc -l)
+	log_success "Found $table_count tables to export"
+
+	local threads
+	threads=$(get_thread_count)
+
+	if [[ "$EXPORT_FORMAT" == "csv" ]]; then
+		_export_database_csv "$tables" "$table_count" "$threads" "$mysql_cmd" "$mysqldump_cmd"
+	else
+		_export_database_sql "$tables" "$table_count" "$mysqldump_cmd"
+	fi
 
 	log_step "Exporting triggers and routines..."
 	if "$mysqldump_cmd" -u "$DB_USER" -p"$DB_PASS" \
-		--single-transaction --skip-lock-tables \
-		--no-data --no-create-info \
-		--routines --triggers \
-		"$DB_NAME" > "$DUMP_DIR/__routines_and_triggers.sql" 2>/dev/null; then
+			$MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			--single-transaction --skip-lock-tables \
+			--no-data --no-create-info \
+			--routines --triggers \
+			"$DB_NAME" > "$DUMP_DIR/__routines_and_triggers.sql" 2>/dev/null; then
 		local routine_count
-		routine_count=$(grep -c "^CREATE.*PROCEDURE\|^CREATE.*FUNCTION\|^CREATE.*TRIGGER" "$DUMP_DIR/__routines_and_triggers.sql" 2>/dev/null || true)
+		routine_count=$(grep -c "^CREATE.*PROCEDURE\|^CREATE.*FUNCTION\|^CREATE.*TRIGGER" \
+			"$DUMP_DIR/__routines_and_triggers.sql" 2>/dev/null || true)
 		if [[ "$routine_count" -gt 0 ]]; then
 			log_success "Exported ${routine_count} routine/trigger definition(s)"
 		else
@@ -839,24 +1065,30 @@ export_database() {
 	else
 		log_warning "Failed to export triggers and routines"
 	fi
-	
+
 	log_step "Recording binlog position at export time.."
 	local master_status
-	master_status=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" -sN \
-		-e "SHOW MASTER STATUS;" 2>/dev/null | head -1)
+	master_status=$("$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" \
+		$MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+		-sN -e "SHOW MASTER STATUS;" 2>/dev/null | head -1)
 
+	local active_format="$EXPORT_FORMAT"
 	if [[ -n "$master_status" ]]; then
-		local binlog_file
-		local binlog_position
+		local binlog_file binlog_position
 		binlog_file=$(echo "$master_status" | awk '{print $1}')
 		binlog_position=$(echo "$master_status" | awk '{print $2}')
 
+		# sql_fallback_tables is populated by _export_database_csv when blob tables are detected.
+		# Empty for SQL exports and for CSV exports with no blob columns.
 		cat > "$DUMP_DIR/__export_meta.txt" <<EOF
 binlog_file=${binlog_file}
 binlog_position=${binlog_position}
 export_timestamp=$(date +"%Y-%m-%d %H:%M:%S")
 db_name=${DB_NAME}
 rockdbutil_version=1.0
+export_format=${active_format}
+csv_load_mode=${CSV_LOAD_MODE}
+sql_fallback_tables=${SQL_FALLBACK_TABLES:-}
 EOF
 		log_success "Binlog position recorded: ${binlog_file}:${binlog_position}"
 	else
@@ -866,20 +1098,159 @@ EOF
 
 	log_step "Creating compressed archive..."
 	if tar -czf "$ARCHIVE_NAME" -C "$DUMP_DIR" . 2>/dev/null; then
-		local archive_size=$(du -h "$ARCHIVE_NAME" | cut -f1)
+		local archive_size
+		archive_size=$(du -h "$ARCHIVE_NAME" | cut -f1)
 		log_success "Archive created: $ARCHIVE_NAME ($archive_size)"
 	else
 		log_error "Failed to create archive"
 		exit 1
 	fi
-	
-	# Cleanup option
-if [[ "$auto_cleanup" == "true" ]]; then
+
+	if [[ "$auto_cleanup" == "true" ]]; then
 		rm -rf "$DUMP_DIR"/*
+		rm -rf "$CSV_OUTFILE_DIR"/*
 		rm -f "$ERROR_REPORT" "$SUCCESS_LOG"
 		rm -rf "$ERROR_LOG_DIR"/*
 		log_success "Temporary files automatically cleaned up"
 	fi
+}
+
+# _export_database_sql - internal SQL export path (legacy behaviour, --sql flag).
+# Exports each table as a full per-table .sql file via mysqldump.
+#
+# Args:
+#   $1 - newline-separated table list
+#   $2 - total table count
+#   $3 - mysqldump command
+_export_database_sql() {
+	local tables="$1"
+	local table_count="$2"
+	local mysqldump_cmd="$3"
+	local exported=0
+
+	log_step "Exporting tables as SQL (legacy mode).."
+	while IFS= read -r table; do
+		[[ -z "$table" ]] && continue
+		log_progress "Dumping table: $table"
+		if "$mysqldump_cmd" -u "$DB_USER" -p"$DB_PASS" \
+				$MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+				--single-transaction --skip-lock-tables \
+				"$DB_NAME" "$table" > "$DUMP_DIR/$table.sql" 2>/dev/null; then
+			exported=$((exported + 1))
+		else
+			log_warning "Failed to dump table: $table"
+		fi
+	done <<< "$tables"
+
+	log_success "Successfully exported $exported/$table_count tables"
+}
+
+# _export_database_csv - internal CSV export path (default).
+# Detects blob tables (SQL fallback), exports schema via mysqldump --no-data,
+# exports data via SELECT INTO OUTFILE, all running in parallel.
+#
+# Args:
+#   $1 - newline-separated table list
+#   $2 - total table count
+#   $3 - thread count
+#   $4 - mysql client command
+#   $5 - mysqldump command
+_export_database_csv() {
+	local tables="$1"
+	local table_count="$2"
+	local threads="$3"
+	local mysql_cmd="$4"
+	local mysqldump_cmd="$5"
+
+	check_secure_file_priv
+
+	if [[ "$CSV_LOAD_MODE" == "disabled" ]]; then
+		log_warning "CSV export not available - falling back to SQL export for all tables"
+		EXPORT_FORMAT="sql"
+		_export_database_sql "$tables" "$table_count" "$mysqldump_cmd"
+		return
+	fi
+
+	log_info "CSV export mode: $CSV_LOAD_MODE (csv_outfile_dir: $CSV_OUTFILE_DIR)"
+
+	local blob_tables=""
+	blob_tables=$(detect_blob_tables)
+
+	SQL_FALLBACK_TABLES=""
+	if [[ -n "$blob_tables" ]]; then
+		local blob_count
+		blob_count=$(echo "$blob_tables" | wc -l)
+		log_warning "Found $blob_count table(s) with blob/binary columns - these will use SQL export:"
+		while IFS= read -r bt; do
+			log_warning "  • $bt"
+		done <<< "$blob_tables"
+		SQL_FALLBACK_TABLES=$(echo "$blob_tables" | tr '\n' ',' | sed 's/,$//')
+	fi
+
+	log_step "Exporting table schemas and CSV data in parallel (${threads} threads).."
+
+	# Build a temp file list so parallel gets clean input without subshell issues.
+	local table_list_file
+	table_list_file=$(mktemp)
+	echo "$tables" > "$table_list_file"
+
+	# Export schema + CSV (or SQL fallback) for each table.
+	# parallel runs export_single_table_csv which is exported below.
+	export -f export_single_table_csv export_table_schema export_table_csv
+	export -f log_info log_warning log_error log_step log_success log_progress
+	export DB_USER DB_PASS DB_NAME MYSQL_HOST_PARAMS MYSQL_PORT_PARAMS
+	export DUMP_DIR CSV_OUTFILE_DIR SQL_FALLBACK_TABLES CSV_LOAD_MODE
+	export RED GREEN YELLOW BLUE PURPLE CYAN WHITE NC
+
+	parallel -j "$threads" export_single_table_csv {} "$mysql_cmd" "$mysqldump_cmd" \
+		:::: "$table_list_file" || true
+
+	rm -f "$table_list_file"
+
+	local csv_count schema_count sql_fallback_count
+	csv_count=$(find "$DUMP_DIR" -maxdepth 1 -name "*.csv" | wc -l)
+	schema_count=$(find "$DUMP_DIR" -maxdepth 1 -name "*.schema.sql" | wc -l)
+	sql_fallback_count=$(find "$DUMP_DIR" -maxdepth 1 -name "*.sql" \
+		! -name "*.schema.sql" ! -name "__*.sql" | wc -l)
+
+	log_success "Schema files: $schema_count  CSV files: $csv_count  SQL fallback: $sql_fallback_count"
+}
+
+# export_single_table_csv - per-table worker called by parallel during CSV export.
+# Routes the table to CSV (schema + data) or SQL fallback (blob tables).
+# Exported so GNU Parallel subshells can inherit it.
+#
+# Args:
+#   $1 - table name
+#   $2 - mysql client command
+#   $3 - mysqldump command
+export_single_table_csv() {
+	local table="$1"
+	local mysql_cmd="$2"
+	local mysqldump_cmd="$3"
+
+	[[ -z "$table" ]] && return 0
+
+	# Check if this table is in the SQL fallback list (blob/binary columns).
+	if echo ",$SQL_FALLBACK_TABLES," | grep -q ",${table},"; then
+		log_progress "SQL fallback (blob): $table"
+		"$mysqldump_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			--single-transaction --skip-lock-tables \
+			"$DB_NAME" "$table" > "$DUMP_DIR/${table}.sql" 2>/dev/null
+		return $?
+	fi
+
+	log_progress "Exporting: $table"
+
+	export_table_schema "$table" "$mysqldump_cmd" || {
+		echo "[WARNING] Schema export failed for table: $table" >&2
+		return 1
+	}
+
+	export_table_csv "$table" "$mysql_cmd" || {
+		echo "[WARNING] CSV export failed for table: $table" >&2
+		return 1
+	}
 }
 
 # === IMPORT WORKER FUNCTIONS ===
@@ -1176,45 +1547,296 @@ import_single_file() {
 	return 1
 }
 
+# import_csv_file - imports a single table from a .csv file using LOAD DATA INFILE.
+# Routes large tables (in __large_tables.txt manifest) to the deferred list instead,
+# so they are handled by chunk_import_csv after all small tables complete.
+#
+# Respects CSV_LOAD_MODE: "server" uses LOAD DATA INFILE, "local" uses LOAD DATA LOCAL INFILE.
+# Same retry logic as import_single_file for lock timeouts and deadlocks.
+#
+# Args:
+#   $1 - csv file path
+#   $2 - mysql client command
+import_csv_file() {
+	local csv_file="$1"
+	local mysql_cmd="$2"
+	local filename
+	filename=$(basename "$csv_file")
+	local table_name="${filename%.csv}"
+	local error_log="$ERROR_LOG_DIR/${filename}.error"
+	local max_retries=3
+	local retry=0
+
+	local manifest="$EXTRACT_DIR/__large_tables.txt"
+	if [[ -f "$manifest" ]] && grep -qx "$table_name" "$manifest"; then
+		local deferred_file="$EXTRACT_DIR/__deferred_large_csv.txt"
+		local deferred_lock="$EXTRACT_DIR/__deferred_large_csv.lock"
+		(
+			flock -x 9
+			grep -qxF "$table_name" "$deferred_file" 2>/dev/null \
+				|| echo "$table_name" >> "$deferred_file"
+		) 9>"$deferred_lock"
+		return 0
+	fi
+
+	local load_keyword="LOAD DATA INFILE"
+	[[ "$CSV_LOAD_MODE" == "local" ]] && load_keyword="LOAD DATA LOCAL INFILE"
+
+	local field_terminator="','"
+	[[ "$CSV_LOAD_MODE" == "local" ]] && field_terminator="'\\t'"
+
+	local csv_abs
+	csv_abs=$(realpath "$csv_file" 2>/dev/null || echo "$csv_file")
+
+	while [[ $retry -lt $max_retries ]]; do
+		local suppress_sql=""
+		[[ "${ROCKDBUTIL_SUPPRESS_BINLOG:-0}" == "1" ]] && suppress_sql="SET SESSION sql_log_bin = 0;"
+
+		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+				"$DB_NAME" 2>"$error_log" <<EOF
+${suppress_sql}
+SET foreign_key_checks = 0;
+SET unique_checks = 0;
+${load_keyword} '${csv_abs}'
+INTO TABLE \`${table_name}\`
+FIELDS TERMINATED BY ${field_terminator}
+ESCAPED BY '\\\\'
+LINES TERMINATED BY '\n';
+EOF
+		then
+			echo "$filename" >> "$SUCCESS_LOG"
+			rm -f "$error_log"
+			[[ $retry -gt 0 ]] && echo "SUCCESS: $filename (after $retry retries)" >&2
+			return 0
+		else
+			((retry++))
+			if grep -q "Lock wait timeout exceeded" "$error_log" && [[ $retry -lt $max_retries ]]; then
+				echo "RETRY $retry/$max_retries: $filename (lock timeout)" >&2
+				sleep $((retry * 2))
+			elif grep -q "Deadlock found" "$error_log" && [[ $retry -lt $max_retries ]]; then
+				echo "RETRY $retry/$max_retries: $filename (deadlock)" >&2
+				sleep $((retry))
+			else
+				break
+			fi
+		fi
+	done
+
+	local retry_text=""
+	[[ $retry -gt 0 ]] && retry_text=" (after $retry retries)"
+	echo "FAILED: $filename$retry_text" >> "$ERROR_REPORT"
+	if [[ -s "$error_log" ]]; then
+		echo "  Error details:" >> "$ERROR_REPORT"
+		sed 's/^/    /' "$error_log" >> "$ERROR_REPORT"
+	fi
+	echo "" >> "$ERROR_REPORT"
+	return 1
+}
+
+# chunk_import_csv - imports a large table CSV using N parallel LOAD DATA INFILE streams.
+# Splits the CSV by line count into N equal chunks using `split`, loads each chunk in
+# parallel, cleans up chunk files on success.
+#
+# Falls back to sequential single-chunk load on lock contention (truncates first).
+#
+# Args:
+#   $1 - csv file path
+#   $2 - mysql client command
+#   $3 - number of chunks
+chunk_import_csv() {
+	local csv_file="$1"
+	local mysql_cmd="$2"
+	local chunks="$3"
+	local filename
+	filename=$(basename "$csv_file")
+	local table_name="${filename%.csv}"
+	local error_log="$ERROR_LOG_DIR/${filename}.chunk.error"
+	local csv_abs
+	csv_abs=$(realpath "$csv_file" 2>/dev/null || echo "$csv_file")
+
+	log_progress "Chunked CSV import: $table_name (${chunks} parallel streams)"
+
+	local total_lines
+	total_lines=$(wc -l < "$csv_file" 2>/dev/null || echo 0)
+
+	if [[ "$total_lines" -eq 0 ]]; then
+		log_warning "$table_name: CSV file is empty - skipping"
+		echo "$filename" >> "$SUCCESS_LOG"
+		return 0
+	fi
+
+	local load_keyword="LOAD DATA INFILE"
+	[[ "$CSV_LOAD_MODE" == "local" ]] && load_keyword="LOAD DATA LOCAL INFILE"
+
+	local field_terminator="','"
+	[[ "$CSV_LOAD_MODE" == "local" ]] && field_terminator="'\\t'"
+
+	local suppress_sql=""
+	[[ "${ROCKDBUTIL_SUPPRESS_BINLOG:-0}" == "1" ]] && suppress_sql="SET SESSION sql_log_bin = 0;"
+
+	if [[ "$CSV_LOAD_MODE" == "local" ]]; then
+		log_progress "Large CSV import: $table_name (single-stream local mode)"
+
+		"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			"$DB_NAME" \
+			-e "ALTER TABLE \`${table_name}\` DISABLE KEYS;" 2>/dev/null || true
+
+		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+				"$DB_NAME" 2>"$error_log" <<EOF
+${suppress_sql}
+SET foreign_key_checks = 0;
+SET unique_checks = 0;
+${load_keyword} '${csv_abs}'
+INTO TABLE \`${table_name}\`
+FIELDS TERMINATED BY ${field_terminator}
+ESCAPED BY '\\\\'
+LINES TERMINATED BY '\n';
+EOF
+		then
+			"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+				"$DB_NAME" \
+				-e "ALTER TABLE \`${table_name}\` ENABLE KEYS;" 2>/dev/null || true
+			echo "$filename" >> "$SUCCESS_LOG"
+			rm -f "$error_log"
+			return 0
+		fi
+
+		"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			"$DB_NAME" \
+			-e "ALTER TABLE \`${table_name}\` ENABLE KEYS;" 2>/dev/null || true
+		echo "FAILED: $filename (large CSV local import failed)" >> "${ERROR_REPORT}.${table_name}"
+		[[ -s "$error_log" ]] && sed 's/^/    /' "$error_log" >> "${ERROR_REPORT}.${table_name}"
+		return 1
+	fi
+
+	local lines_per_chunk=$(( (total_lines + chunks - 1) / chunks ))
+
+	local chunk_prefix="$EXTRACT_DIR/${table_name}_csvchunk_"
+	split -l "$lines_per_chunk" "$csv_file" "$chunk_prefix"
+
+	# Disable secondary key maintenance for the duration of bulk load.
+	# DISABLE KEYS eliminates index lock contention between parallel chunk streams
+	# and defers the index rebuild to a single sorted pass after all data is loaded,
+	# which is substantially faster than per-row index updates during LOAD DATA.
+	"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+		"$DB_NAME" \
+		-e "ALTER TABLE \`${table_name}\` DISABLE KEYS;" 2>/dev/null || true
+
+	local chunk_pids=()
+	local chunk_files=()
+
+	while IFS= read -r -d '' chunk_file; do
+		chunk_files+=("$chunk_file")
+		local chunk_abs
+		chunk_abs=$(realpath "$chunk_file" 2>/dev/null || echo "$chunk_file")
+		local chunk_error_log="${chunk_file}.error"
+
+		"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+				"$DB_NAME" 2>"$chunk_error_log" <<EOF &
+${suppress_sql}
+SET foreign_key_checks = 0;
+SET unique_checks = 0;
+${load_keyword} '${chunk_abs}'
+INTO TABLE \`${table_name}\`
+FIELDS TERMINATED BY ${field_terminator}
+ESCAPED BY '\\\\'
+LINES TERMINATED BY '\n';
+EOF
+		chunk_pids+=($!)
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "${table_name}_csvchunk_*" -print0 | sort -z)
+
+	local chunk_failed=0
+	local pid_idx=0
+	while [[ $pid_idx -lt ${#chunk_pids[@]} ]]; do
+		if ! wait "${chunk_pids[$pid_idx]}"; then
+			chunk_failed=$(( chunk_failed + 1 ))
+			cat "${chunk_files[$pid_idx]}.error" >> "$error_log" 2>/dev/null || true
+		fi
+		rm -f "${chunk_files[$pid_idx]}.error"
+		(( pid_idx++ )) || true
+	done
+
+	# Lock contention on parallel chunk loads - truncate and retry sequentially.
+	# DISABLE KEYS is already in effect so the sequential retry has no index contention.
+	if [[ $chunk_failed -gt 0 ]] && grep -q "Lock wait timeout\|Deadlock" "$error_log" 2>/dev/null; then
+		log_warning "$table_name: lock contention on CSV chunks - truncating and retrying sequentially"
+		"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+			"$DB_NAME" \
+			-e "SET foreign_key_checks = 0; TRUNCATE TABLE \`${table_name}\`;" 2>/dev/null || true
+		> "$error_log"
+		chunk_failed=0
+
+		# Re-split into fresh chunk files and load one at a time.
+		# rm -f only runs on a successful load - a failed chunk is left on disk
+		# so the error log and chunk count remain consistent for diagnostics.
+		split -l "$lines_per_chunk" "$csv_file" "$chunk_prefix"
+		while IFS= read -r -d '' retry_chunk; do
+			local retry_abs
+			retry_abs=$(realpath "$retry_chunk" 2>/dev/null || echo "$retry_chunk")
+				"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+						"$DB_NAME" 2>>"$error_log" <<EOF
+${suppress_sql}
+SET foreign_key_checks = 0;
+SET unique_checks = 0;
+${load_keyword} '${retry_abs}'
+INTO TABLE \`${table_name}\`
+FIELDS TERMINATED BY ${field_terminator}
+ESCAPED BY '\\\\'
+LINES TERMINATED BY '\n';
+EOF
+			if [[ $? -ne 0 ]]; then
+				chunk_failed=$(( chunk_failed + 1 ))
+			else
+				rm -f "$retry_chunk"
+			fi
+		done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "${table_name}_csvchunk_*" -print0 | sort -z)
+	fi
+
+	# Rebuild secondary indexes in a single sorted pass now that all data is loaded.
+	# Runs regardless of outcome so the table is left in a consistent state.
+	"$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+		"$DB_NAME" \
+		-e "ALTER TABLE \`${table_name}\` ENABLE KEYS;" 2>/dev/null || true
+
+	# Clean up any remaining first-pass chunk files (retry chunks already removed above).
+	local cf
+	for cf in "${chunk_files[@]}"; do
+		rm -f "$cf"
+	done
+
+	if [[ $chunk_failed -gt 0 ]]; then
+		echo "FAILED: $filename (chunked CSV import failed)" >> "${ERROR_REPORT}.${table_name}"
+		[[ -s "$error_log" ]] && sed 's/^/    /' "$error_log" >> "${ERROR_REPORT}.${table_name}"
+		return 1
+	fi
+
+	echo "$filename" >> "$SUCCESS_LOG"
+	rm -f "$error_log"
+	return 0
+}
+
 # Export worker functions and all globals they depend on.
 # Called once at script load time - both import_database() and selective_restore()
 # rely on these being available in GNU Parallel worker subshells.
 register_worker_exports() {
-	export -f import_single_file chunk_import_file log_progress log_info log_success log_warning log_error log_step
-	export DB_USER DB_PASS DB_NAME ERROR_LOG_DIR ERROR_REPORT SUCCESS_LOG EXTRACT_DIR LARGE_TABLE_CHUNKS
+	export -f import_single_file chunk_import_file import_csv_file chunk_import_csv
+	export -f log_progress log_info log_success log_warning log_error log_step
+	export DB_USER DB_PASS DB_NAME MYSQL_HOST_PARAMS MYSQL_PORT_PARAMS
+	export ERROR_LOG_DIR ERROR_REPORT SUCCESS_LOG EXTRACT_DIR LARGE_TABLE_CHUNKS
 	export INNODB_FLUSH_LOG_OPT INNODB_DOUBLEWRITE_OPT INNODB_IO_CAPACITY_OPT MAX_CONCURRENT_LARGE_TABLES
-	export ROCKDBUTIL_SUPPRESS_BINLOG
+	export ROCKDBUTIL_SUPPRESS_BINLOG CSV_LOAD_MODE
 	export RED GREEN YELLOW BLUE PURPLE CYAN WHITE NC
 }
 
 # === IMPORT FILE RESOLVER ===
-# Detects whether the supplied file is a .sql.gz (monolithic prod dump) or a
-# .tar.gz (rockdbutil export). For .sql.gz files, sqlsplit.sh is called to split
-# the dump directly into EXTRACT_DIR, bypassing the tar extraction step entirely.
-#
-# Sets the caller-scoped variable IMPORT_TYPE to "split" or "archive".
-# Must NOT be called inside $() - sqlsplit needs to run in the foreground
-# so its output is visible and it has access to the real filesystem.
+# Detects whether the supplied file is a monolithic .sql.gz or a rockdbutil .tar.gz.
+# Monolithic .sql.gz imports are first split into per-table SQL files so the parallel
+# SQL import and large-table chunking pipeline can be used.
 resolve_import_file() {
 	local archive_file="$1"
 
 	if [[ "$archive_file" == *.sql.gz ]]; then
-		log_step "Detected monolithic SQL dump (.sql.gz) - invoking sqlsplit.."
-
-		if [[ ! -f "$SQLSPLIT_PATH" ]]; then
-			log_error "sqlsplit.sh not found at: $SQLSPLIT_PATH"
-			log_info "Place sqlsplit.sh in the same directory as rockdbutil.sh"
-			exit 1
-		fi
-
-		if [[ ! -x "$SQLSPLIT_PATH" ]]; then
-			log_error "sqlsplit.sh is not executable: $SQLSPLIT_PATH"
-			log_info "Run: chmod +x $SQLSPLIT_PATH"
-			exit 1
-		fi
-
-		bash "$SQLSPLIT_PATH" "$archive_file" --direct-to-dir "$EXTRACT_DIR" --db-name "$DB_NAME" --threshold "$LARGE_TABLE_THRESHOLD_MB"
-		IMPORT_TYPE="split"
+		IMPORT_TYPE="split_sql"
 		return
 	fi
 
@@ -1229,20 +1851,20 @@ import_database() {
 	local cleanup_buffer=false
 	local import_start_time=$(date +%s)
 	trap 'if [[ "${cleanup_buffer:-false}" == "true" ]]; then restore_import_optimizations; fi' EXIT
-	
+
 	if [[ -z "$archive_file" ]]; then
 		log_error "Archive file not specified"
 		show_usage
 		exit 1
 	fi
-	
+
 	if [[ ! -f "$archive_file" ]]; then
 		log_error "Archive file not found: $archive_file"
 		exit 1
 	fi
-	
+
 	log_step "Starting database import process.."
-	
+
 	check_command "parallel"
 	check_command "bc"
 	test_db_connection
@@ -1250,20 +1872,23 @@ import_database() {
 	# Clean any stale optimization state files from previous interrupted runs.
 	rm -f "$BASE_DIR"/.original_*
 
-	local buffer_info=$(get_optimal_buffer_size)
-	local current_buffer_gb=$(echo "$buffer_info" | cut -d: -f1)
-	local suggested_buffer_gb=$(echo "$buffer_info" | cut -d: -f2) 
-	local total_ram_gb=$(echo "$buffer_info" | cut -d: -f3)
+	local buffer_info
+	buffer_info=$(get_optimal_buffer_size)
+	local current_buffer_gb
+	current_buffer_gb=$(echo "$buffer_info" | cut -d: -f1)
+	local suggested_buffer_gb
+	suggested_buffer_gb=$(echo "$buffer_info" | cut -d: -f2)
+	local total_ram_gb
+	total_ram_gb=$(echo "$buffer_info" | cut -d: -f3)
 
-	local mysql_cmd=$(get_mysql_command)
-	
 	echo -e "${WHITE}System Memory Status:${NC}"
 	echo "Total RAM: ${total_ram_gb}GB"
 	echo "Available: $(free -h | awk '/^Mem:/{print $7}')"
 	echo "Current Buffer Pool: ${current_buffer_gb}GB"
-	
+
 	local use_buffer_optimization=false
-	local available_gb=$(free -g | awk '/^Mem:/{print $7}')
+	local available_gb
+	available_gb=$(free -g | awk '/^Mem:/{print $7}')
 	local safe_max_gb=$((available_gb - 2))
 	local original_suggested=$((total_ram_gb * 70 / 100))
 
@@ -1281,14 +1906,13 @@ import_database() {
 
 	if [[ $(echo "$suggested_buffer_gb > $current_buffer_gb" | bc 2>/dev/null) == "1" ]]; then
 		log_info "Buffer optimization will be applied: ${current_buffer_gb}GB → ${suggested_buffer_gb}GB"
-		
+
 		if [[ "$auto_cleanup" == "true" ]]; then
 			if apply_import_optimizations "$suggested_buffer_gb"; then
 				use_buffer_optimization=true
 				cleanup_buffer=true
 			fi
 		else
-			# Interactive mode
 			read -p "$(echo -e "${YELLOW}Temporarily increase buffer pool to ${suggested_buffer_gb}GB for faster import? [Y/n]:${NC} ")" -n 1 -r
 			echo
 			if [[ ! $REPLY =~ ^[Nn]$ ]]; then
@@ -1299,11 +1923,13 @@ import_database() {
 			fi
 		fi
 	fi
-	
-	local mysql_cmd=$(get_mysql_command)
-	local threads=$(get_thread_count)
+
+	local mysql_cmd
+	mysql_cmd=$(get_mysql_command)
+	local threads
+	threads=$(get_thread_count)
 	log_info "Using $threads parallel threads for import"
-	
+
 	setup_directories
 	if [[ -d "$EXTRACT_DIR" ]] && [[ "$(ls -A "$EXTRACT_DIR" 2>/dev/null)" ]]; then
 		log_warning "Extract directory contains files. Removing old files.."
@@ -1311,22 +1937,41 @@ import_database() {
 	fi
 	rm -rf "$ERROR_LOG_DIR"/*
 	log_success "Using extraction directory: $EXTRACT_DIR"
-	
+
 	IMPORT_TYPE=""
 	resolve_import_file "$archive_file"
 
-	if [[ "$IMPORT_TYPE" == "archive" ]]; then
+	if [[ "$IMPORT_TYPE" == "split_sql" ]]; then
+		log_step "Detected monolithic SQL dump (.sql.gz) - invoking sqlsplit.."
+
+		if [[ ! -f "$SQLSPLIT_PATH" ]]; then
+			log_error "sqlsplit.sh not found at: $SQLSPLIT_PATH"
+			log_info "Place sqlsplit.sh in the same directory as rockdbutil.sh"
+			exit 1
+		fi
+
+		if [[ ! -x "$SQLSPLIT_PATH" ]]; then
+			log_error "sqlsplit.sh is not executable: $SQLSPLIT_PATH"
+			log_info "Run: chmod +x $SQLSPLIT_PATH"
+			exit 1
+		fi
+
+		bash "$SQLSPLIT_PATH" "$archive_file" --direct-to-dir "$EXTRACT_DIR" --db-name "$DB_NAME" --threshold "$LARGE_TABLE_THRESHOLD_MB"
+		IMPORT_TYPE="split"
+	elif [[ "$IMPORT_TYPE" == "archive" ]]; then
 		log_step "Extracting archive: $archive_file"
 		if tar -xzf "$archive_file" -C "$EXTRACT_DIR" 2>/dev/null; then
-			local file_count=$(find "$EXTRACT_DIR" -name "*.sql" | wc -l)
+			local file_count
+			file_count=$(find "$EXTRACT_DIR" -name "*.sql" | wc -l)
 			log_success "Extracted $file_count SQL files"
 		else
 			log_error "Failed to extract archive"
 			exit 1
 		fi
 	else
-		local file_count=$(find "$EXTRACT_DIR" -name "*.sql" | wc -l)
-		log_success "Split complete - $file_count SQL files ready in extract directory"
+		local file_count
+		file_count=$(find "$EXTRACT_DIR" -maxdepth 1 \( -name "*.sql" -o -name "*.csv" \) ! -name "__*.sql" | wc -l)
+		log_success "Split complete - $file_count files ready in extract directory"
 	fi
 
 	if [[ -f "$EXTRACT_DIR/__export_meta.txt" ]]; then
@@ -1334,166 +1979,45 @@ import_database() {
 		log_info "Export metadata saved to: $BASE_DIR/last_export_meta.txt"
 	fi
 
-	local sql_files=("$EXTRACT_DIR"/*.sql)
-	if [[ ! -e "${sql_files[0]}" ]]; then
-		log_error "No SQL files found in archive"
-		exit 1
+	local archive_export_format="sql"
+	local archive_csv_load_mode="server"
+	if [[ -f "$EXTRACT_DIR/__export_meta.txt" ]]; then
+		local meta_format
+		meta_format=$(grep "^export_format=" "$EXTRACT_DIR/__export_meta.txt" | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+		[[ "$meta_format" == "csv" ]] && archive_export_format="csv"
+
+		local meta_load_mode
+		meta_load_mode=$(grep "^csv_load_mode=" "$EXTRACT_DIR/__export_meta.txt" | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+		[[ -n "$meta_load_mode" ]] && archive_csv_load_mode="$meta_load_mode"
 	fi
-	
-	log_step "Importing SQL files into database: $DB_NAME"
-	log_info "This may take some time depending on database size.."
 
 	> "$ERROR_REPORT"
 	> "$SUCCESS_LOG"
 
 	register_worker_exports
 
-	# Import sequences first - they are shared across tables and conflict under parallel import.
-	# __sequences.sql is written by sqlsplit when a monolithic .sql.gz is the source.
-	local sequences_file="$EXTRACT_DIR/__sequences.sql"
-	if [[ -f "$sequences_file" && -s "$sequences_file" ]]; then
-		log_step "Importing database sequences (pre-import step)..."
-		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$sequences_file" 2>"$ERROR_LOG_DIR/__sequences.error"; then
-			log_success "Sequences imported successfully"
-			rm -f "$ERROR_LOG_DIR/__sequences.error"
-		else
-			log_warning "Sequence import had errors (may be harmless if sequences already exist)"
-			cat "$ERROR_LOG_DIR/__sequences.error" | grep -v "^$" | head -5 >&2 || true
-		fi
-	fi
-
-	local total_files=$(find "$EXTRACT_DIR" -name "*.sql" ! -name "__*.sql" | wc -l)
-
-	monitor_import_progress() {
-		local total=$1
-		local start_time=$(date +%s)
-		local last_count=0
-		local last_log_time=$start_time
-		
-		while true; do
-			if [[ -f "$SUCCESS_LOG" ]]; then
-				local completed=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
-				local current_time=$(date +%s)
-				local time_since_last_log=$((current_time - last_log_time))
-				
-				if [[ $completed -gt $last_count && $completed -gt 0 ]]; then
-					local elapsed=$((current_time - start_time))
-					local minutes=$((elapsed / 60))
-					local seconds=$((elapsed % 60))
-					
-					log_progress "Imported $completed/$total tables (${minutes}m ${seconds}s elapsed)"
-					last_count=$completed
-					last_log_time=$current_time
-				elif [[ $time_since_last_log -ge 10 && $completed -gt 0 ]]; then
-					local remaining=$((total - completed))
-					log_progress "Still working: $completed/$total complete, $remaining remaining (processing large tables)"
-					last_log_time=$current_time
-				fi
-			fi
-			sleep 3
-			
-			# Check if import is complete
-			if ! pgrep -f "parallel.*import_single_file" > /dev/null; then
-				break
-			fi
-		done
-	}
-
-	monitor_import_progress "$total_files" &
-	local monitor_pid=$!
-
-	local import_success=false
-	local sql_file_list=()
-	while IFS= read -r -d '' f; do
-		sql_file_list+=("$f")
-	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql" -print0)
-
-	parallel -j "$threads" import_single_file {} "$mysql_cmd" ::: "${sql_file_list[@]}" || true
-	kill $monitor_pid 2>/dev/null || true
-	wait $monitor_pid 2>/dev/null || true
-
-	# Import large tables sequentially after small tables complete - each gets
-	# the full database to itself for its chunked parallel streams, avoiding
-	# lock contention between concurrent large table imports.
-	local deferred_file="$EXTRACT_DIR/__deferred_large.txt"
-	if [[ -f "$deferred_file" && -s "$deferred_file" ]]; then
-		# Pre-compute row counts for all large tables in parallel before import starts.
-		# Eliminates the sequential awk scan inside chunk_import_file for each table.
-		log_info "Pre-computing row counts for large tables..."
-		while IFS= read -r table_name; do
-			local sql_file="$EXTRACT_DIR/${table_name}.sql"
-			awk '/^\(/ { count++ } END { print count+0 }' "$sql_file" \
-				> "$EXTRACT_DIR/${table_name}.rowcount" &
-		done < "$deferred_file"
-		wait
-		log_info "Row counts ready"
-
-log_step "Importing large tables (${MAX_CONCURRENT_LARGE_TABLES} concurrent, ${LARGE_TABLE_CHUNKS} streams per table).."
-		local large_pids=()
-		local large_names=()
-		local running=0
-		local max_concurrent=$MAX_CONCURRENT_LARGE_TABLES
-
-		while IFS= read -r table_name; do
-			local sql_file="$EXTRACT_DIR/${table_name}.sql"
-			local file_size_mb=$(( $(stat -c%s "$sql_file" 2>/dev/null || echo 0) / 1024 / 1024 ))
-			log_progress "Large table: $table_name (${file_size_mb}MB)"
-			chunk_import_file "$sql_file" "$mysql_cmd" "$LARGE_TABLE_CHUNKS" &
-			large_pids+=($!)
-			large_names+=("$table_name")
-			running=$(( running + 1 ))
-
-			if [[ $running -ge $max_concurrent ]]; then
-				wait "${large_pids[0]}" || true
-				large_pids=("${large_pids[@]:1}")
-				large_names=("${large_names[@]:1}")
-				running=$(( running - 1 ))
-			fi
-		done < "$deferred_file"
-
-		# Wait for any remaining background jobs
-		local p
-		for p in "${large_pids[@]}"; do
-			wait "$p" || true
-		done
-	fi
-
-	local success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
-	local total_count=$(find "$EXTRACT_DIR" -name "*.sql" ! -name "__*.sql" | wc -l)
-
-	# Deferred large tables counted as success in SUCCESS_LOG by chunk_import_file.
-	# Only check ERROR_REPORT for genuine failures - ignore the count arithmetic.
-	if grep -q "^FAILED:" "$ERROR_REPORT" 2>/dev/null; then
-		local failed_count=$((total_count - success_count))
-		log_warning "$failed_count out of $total_count imports failed"
-		log_info "Will retry failed imports sequentially.."
-		if retry_failed_imports "$mysql_cmd"; then
-			log_success "Failed imports successfully retried"
-			import_success=true
-		else
-			log_error "Some imports still failed after retry attempts"
-			import_success=false
-		fi
+	if [[ "$archive_export_format" == "csv" ]]; then
+		CSV_LOAD_MODE="$archive_csv_load_mode"
+		export CSV_LOAD_MODE
+		log_info "CSV archive detected (load_mode: $CSV_LOAD_MODE) - using three-phase import"
+		_import_database_csv "$mysql_cmd" "$threads" "$auto_cleanup" "$use_buffer_optimization"
 	else
-		log_success "All $success_count SQL files imported successfully"
-		import_success=true
+		_import_database_sql "$mysql_cmd" "$threads" "$auto_cleanup" "$use_buffer_optimization"
 	fi
 
-	if [[ "$auto_cleanup" == "true" && "$import_success" == "true" ]]; then
-		rm -rf "$EXTRACT_DIR"/*
-		rm -f "$ERROR_REPORT" "$SUCCESS_LOG"
-		rm -rf "$ERROR_LOG_DIR"/*
-		log_success "Temporary files automatically cleaned up"
-	fi
-	
-	if [[ "$use_buffer_optimization" == "true" ]]; then
-		restore_import_optimizations
-	fi
-	
-	local import_end_time=$(date +%s)
-	local import_duration=$((import_end_time - import_start_time))
-	local import_minutes=$((import_duration / 60))
-	local import_seconds=$((import_duration % 60))
+	local import_end_time
+	import_end_time=$(date +%s)
+	local import_duration=$(( import_end_time - import_start_time ))
+	local import_minutes=$(( import_duration / 60 ))
+	local import_seconds=$(( import_duration % 60 ))
+
+	local import_success_flag="$BASE_DIR/.import_success"
+	local import_count_file="$BASE_DIR/.import_count"
+	local import_success=false
+	local total_imported=0
+	[[ -f "$import_success_flag" ]] && import_success=true
+	[[ -f "$import_count_file" ]] && total_imported=$(cat "$import_count_file" 2>/dev/null || echo "0")
+	rm -f "$import_success_flag" "$import_count_file"
 
 	echo
 	if [[ "$import_success" == "true" ]]; then
@@ -1501,7 +2025,8 @@ log_step "Importing large tables (${MAX_CONCURRENT_LARGE_TABLES} concurrent, ${L
 		echo -e "${GREEN}║       Import completed successfully!     ║${NC}"
 		echo -e "${GREEN}╚══════════════════════════════════════════╝${NC}"
 		echo -e "  Database : ${WHITE}$DB_NAME${NC}"
-		echo -e "  Tables   : ${WHITE}$total_files${NC}"
+		echo -e "  Tables   : ${WHITE}${total_imported}${NC}"
+		echo -e "  Format   : ${WHITE}${archive_export_format}${NC}"
 		echo -e "  Duration : ${WHITE}${import_minutes}m ${import_seconds}s${NC}"
 		echo
 	else
@@ -1513,6 +2038,373 @@ log_step "Importing large tables (${MAX_CONCURRENT_LARGE_TABLES} concurrent, ${L
 		echo
 		exit 1
 	fi
+}
+
+# _import_database_sql - SQL import path (legacy .tar.gz and .sql.gz archives).
+# Unchanged from Phase 1 behaviour - parallel import_single_file, deferred large
+# table chunking via chunk_import_file, retry on failure.
+#
+# Args:
+#   $1 - mysql client command
+#   $2 - thread count
+#   $3 - auto_cleanup flag
+#   $4 - use_buffer_optimization flag
+_import_database_sql() {
+	local mysql_cmd="$1"
+	local threads="$2"
+	local auto_cleanup="$3"
+	local use_buffer_optimization="$4"
+
+	local sql_files=("$EXTRACT_DIR"/*.sql)
+	if [[ ! -e "${sql_files[0]}" ]]; then
+		log_error "No SQL files found in archive"
+		exit 1
+	fi
+
+	log_step "Importing SQL files into database: $DB_NAME"
+	log_info "This may take some time depending on database size.."
+
+	# Import sequences first - shared across tables, conflict under parallel import.
+	local sequences_file="$EXTRACT_DIR/__sequences.sql"
+	if [[ -f "$sequences_file" && -s "$sequences_file" ]]; then
+		log_step "Importing database sequences (pre-import step).."
+		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+				"$DB_NAME" < "$sequences_file" 2>"$ERROR_LOG_DIR/__sequences.error"; then
+			log_success "Sequences imported successfully"
+			rm -f "$ERROR_LOG_DIR/__sequences.error"
+		else
+			log_warning "Sequence import had errors (may be harmless if sequences already exist)"
+			grep -v "^$" "$ERROR_LOG_DIR/__sequences.error" | head -5 >&2 || true
+		fi
+	fi
+
+	local total_files
+	total_files=$(find "$EXTRACT_DIR" -name "*.sql" ! -name "__*.sql" | wc -l)
+
+	_monitor_import_progress "$total_files" "import_single_file" &
+	local monitor_pid=$!
+
+	local sql_file_list=()
+	while IFS= read -r -d '' f; do
+		sql_file_list+=("$f")
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql" -print0)
+
+	parallel -j "$threads" import_single_file {} "$mysql_cmd" ::: "${sql_file_list[@]}" || true
+	kill "$monitor_pid" 2>/dev/null || true
+	wait "$monitor_pid" 2>/dev/null || true
+
+	local deferred_file="$EXTRACT_DIR/__deferred_large.txt"
+	if [[ -f "$deferred_file" && -s "$deferred_file" ]]; then
+		log_info "Pre-computing row counts for large tables.."
+		while IFS= read -r table_name; do
+			local sql_file="$EXTRACT_DIR/${table_name}.sql"
+			awk '/^\(/ { count++ } END { print count+0 }' "$sql_file" \
+				> "$EXTRACT_DIR/${table_name}.rowcount" &
+		done < "$deferred_file"
+		wait
+		log_info "Row counts ready"
+
+		log_step "Importing large tables (${MAX_CONCURRENT_LARGE_TABLES} concurrent, ${LARGE_TABLE_CHUNKS} streams per table).."
+		local large_pids=()
+		local running=0
+
+		while IFS= read -r table_name; do
+			local sql_file="$EXTRACT_DIR/${table_name}.sql"
+			local file_size_mb=$(( $(stat -c%s "$sql_file" 2>/dev/null || echo 0) / 1024 / 1024 ))
+			log_progress "Large table: $table_name (${file_size_mb}MB)"
+			chunk_import_file "$sql_file" "$mysql_cmd" "$LARGE_TABLE_CHUNKS" &
+			large_pids+=($!)
+			running=$(( running + 1 ))
+
+			if [[ $running -ge $MAX_CONCURRENT_LARGE_TABLES ]]; then
+				wait "${large_pids[0]}" || true
+				large_pids=("${large_pids[@]:1}")
+				running=$(( running - 1 ))
+			fi
+		done < "$deferred_file"
+
+		local p
+		for p in "${large_pids[@]}"; do
+			wait "$p" || true
+		done
+	fi
+
+	local success_count
+	success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
+	local import_success=false
+
+	if grep -q "^FAILED:" "$ERROR_REPORT" 2>/dev/null; then
+		local total_count
+		total_count=$(find "$EXTRACT_DIR" -name "*.sql" ! -name "__*.sql" | wc -l)
+		local failed_count=$(( total_count - success_count ))
+		log_warning "$failed_count out of $total_count imports failed"
+		log_info "Will retry failed imports sequentially.."
+		if retry_failed_imports "$mysql_cmd"; then
+			log_success "Failed imports successfully retried"
+			import_success=true
+		else
+			log_error "Some imports still failed after retry attempts"
+		fi
+	else
+		log_success "All $success_count SQL files imported successfully"
+		import_success=true
+	fi
+
+	local final_count
+	final_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
+	echo "$final_count" > "$BASE_DIR/.import_count"
+
+	if [[ "$use_buffer_optimization" == "true" ]]; then
+		restore_import_optimizations
+	fi
+
+	if [[ "$auto_cleanup" == "true" && "$import_success" == "true" ]]; then
+		rm -rf "$EXTRACT_DIR"/*
+		rm -f "$ERROR_REPORT" "$SUCCESS_LOG"
+		rm -rf "$ERROR_LOG_DIR"/*
+		log_success "Temporary files automatically cleaned up"
+	fi
+
+	[[ "$import_success" == "true" ]] && touch "$BASE_DIR/.import_success"
+}
+
+# _import_database_csv - three-phase CSV import path.
+#
+# Phase 1 (sequential): Import all *.schema.sql files - DDL only, fast, FK checks off.
+#                       SQL fallback tables (blob columns) use their full .sql files here.
+# Phase 2 (parallel):   LOAD DATA INFILE for all *.csv files via import_csv_file.
+#                       Large tables deferred to chunk_import_csv.
+# Phase 3 (sequential): Routines, triggers, sequences - unchanged from SQL path.
+#
+# Args:
+#   $1 - mysql client command
+#   $2 - thread count
+#   $3 - auto_cleanup flag
+#   $4 - use_buffer_optimization flag
+_import_database_csv() {
+	local mysql_cmd="$1"
+	local threads="$2"
+	local auto_cleanup="$3"
+	local use_buffer_optimization="$4"
+
+	# -- Phase 1: Schema --
+	log_step "Phase 1/3 - Importing table schemas.."
+	local schema_phase_start
+	schema_phase_start=$(date +%s)
+
+	local schema_files=()
+	while IFS= read -r -d '' f; do
+		schema_files+=("$f")
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.schema.sql" -print0)
+
+	# SQL fallback files (blob tables) - full .sql files, not just schema
+	local sql_fallback_files=()
+	while IFS= read -r -d '' f; do
+		sql_fallback_files+=("$f")
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" \
+		! -name "*.schema.sql" ! -name "__*.sql" -print0)
+
+	if [[ ${#schema_files[@]} -eq 0 && ${#sql_fallback_files[@]} -eq 0 ]]; then
+		log_error "No schema files found in CSV archive"
+		exit 1
+	fi
+
+	local schema_errors=0
+	local schema_file
+	for schema_file in "${schema_files[@]}"; do
+		local schema_name
+		schema_name=$(basename "$schema_file" .schema.sql)
+		if ! {
+			echo "SET foreign_key_checks = 0;"
+			cat "$schema_file"
+		} | "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+				"$DB_NAME" 2>"$ERROR_LOG_DIR/${schema_name}.schema.error"; then
+			log_warning "Schema import failed for: $schema_name"
+			schema_errors=$(( schema_errors + 1 ))
+		else
+			rm -f "$ERROR_LOG_DIR/${schema_name}.schema.error"
+		fi
+	done
+
+	local schema_count=${#schema_files[@]}
+	local imported_schemas=$(( schema_count - schema_errors ))
+	log_timed_success "Schemas imported: $imported_schemas/$schema_count" "$schema_phase_start"
+
+	# -- Phase 1b: SQL fallback tables (blob columns) --
+	if [[ ${#sql_fallback_files[@]} -gt 0 ]]; then
+		log_step "Phase 1b/3 - Importing SQL fallback tables (blob/binary columns).."
+		local fallback_phase_start
+		fallback_phase_start=$(date +%s)
+
+		# Import sequences first if present
+		local sequences_file="$EXTRACT_DIR/__sequences.sql"
+		if [[ -f "$sequences_file" && -s "$sequences_file" ]]; then
+			if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+					"$DB_NAME" < "$sequences_file" 2>"$ERROR_LOG_DIR/__sequences.error"; then
+				log_success "Sequences imported successfully"
+				rm -f "$ERROR_LOG_DIR/__sequences.error"
+			else
+				log_warning "Sequence import had errors (may be harmless if sequences already exist)"
+				grep -v "^$" "$ERROR_LOG_DIR/__sequences.error" | head -5 >&2 || true
+			fi
+		fi
+
+		parallel -j "$threads" import_single_file {} "$mysql_cmd" ::: "${sql_fallback_files[@]}" || true
+		local fallback_success
+		fallback_success=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
+		log_timed_success "SQL fallback tables imported: $fallback_success/${#sql_fallback_files[@]}" "$fallback_phase_start"
+	fi
+
+	# -- Phase 2: CSV data --
+	log_step "Phase 2/3 - Loading CSV data (${threads} parallel streams).."
+	local csv_phase_start
+	csv_phase_start=$(date +%s)
+
+	local csv_files=()
+	while IFS= read -r -d '' f; do
+		csv_files+=("$f")
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.csv" -print0)
+
+	if [[ ${#csv_files[@]} -eq 0 ]]; then
+		log_warning "No CSV files found in archive - skipping data load phase"
+	else
+		local total_csv=${#csv_files[@]}
+
+		_monitor_import_progress "$total_csv" "import_csv_file" &
+		local monitor_pid=$!
+
+		parallel -j "$threads" import_csv_file {} "$mysql_cmd" ::: "${csv_files[@]}" || true
+		kill "$monitor_pid" 2>/dev/null || true
+		wait "$monitor_pid" 2>/dev/null || true
+
+		# Large CSV tables deferred by import_csv_file into __deferred_large_csv.txt
+		local deferred_csv_file="$EXTRACT_DIR/__deferred_large_csv.txt"
+		if [[ -f "$deferred_csv_file" && -s "$deferred_csv_file" ]]; then
+			log_step "Importing large CSV tables (${MAX_CONCURRENT_LARGE_TABLES} concurrent, ${LARGE_TABLE_CHUNKS} streams per table).."
+			local large_pids=()
+			local running=0
+
+			while IFS= read -r table_name; do
+				local csv_file="$EXTRACT_DIR/${table_name}.csv"
+				local file_size_mb=$(( $(stat -c%s "$csv_file" 2>/dev/null || echo 0) / 1024 / 1024 ))
+				log_progress "Large CSV table: $table_name (${file_size_mb}MB)"
+				chunk_import_csv "$csv_file" "$mysql_cmd" "$LARGE_TABLE_CHUNKS" &
+				large_pids+=($!)
+				running=$(( running + 1 ))
+
+				if [[ $running -ge $MAX_CONCURRENT_LARGE_TABLES ]]; then
+					wait "${large_pids[0]}" || true
+					large_pids=("${large_pids[@]:1}")
+					running=$(( running - 1 ))
+				fi
+			done < "$deferred_csv_file"
+
+			local p
+			for p in "${large_pids[@]}"; do
+				wait "$p" || true
+			done
+		fi
+
+			local csv_success_count
+			csv_success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
+			log_timed_success "CSV tables loaded: $csv_success_count/$total_csv" "$csv_phase_start"
+	fi
+
+	# -- Phase 3: Routines, triggers, sequences --
+	log_step "Phase 3/3 - Importing routines and triggers.."
+	local routines_phase_start
+	routines_phase_start=$(date +%s)
+
+	local routines_file="$EXTRACT_DIR/__routines_and_triggers.sql"
+	if [[ -f "$routines_file" && -s "$routines_file" ]]; then
+		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" $MYSQL_HOST_PARAMS $MYSQL_PORT_PARAMS \
+				"$DB_NAME" < "$routines_file" 2>"$ERROR_LOG_DIR/__routines.error"; then
+			log_success "Routines and triggers imported successfully"
+			rm -f "$ERROR_LOG_DIR/__routines.error"
+		else
+			log_warning "Routines/triggers import had errors"
+			grep -v "^$" "$ERROR_LOG_DIR/__routines.error" | head -5 >&2 || true
+		fi
+	else
+		log_info "No routines or triggers file found - skipping"
+	fi
+	log_timed_success "Phase 3 complete" "$routines_phase_start"
+
+	local import_success=false
+	if grep -q "^FAILED:" "$ERROR_REPORT" 2>/dev/null; then
+		local success_count
+		success_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
+		log_warning "Some imports failed - retrying sequentially.."
+		if retry_failed_imports "$mysql_cmd"; then
+			log_success "Failed imports successfully retried"
+			import_success=true
+		else
+			log_error "Some imports still failed after retry attempts"
+		fi
+	else
+		import_success=true
+	fi
+
+	local final_count
+	final_count=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
+	echo "$final_count" > "$BASE_DIR/.import_count"
+
+	if [[ "$use_buffer_optimization" == "true" ]]; then
+		restore_import_optimizations
+	fi
+
+	if [[ "$auto_cleanup" == "true" && "$import_success" == "true" ]]; then
+		rm -rf "$EXTRACT_DIR"/*
+		rm -f "$ERROR_REPORT" "$SUCCESS_LOG"
+		rm -rf "$ERROR_LOG_DIR"/*
+		log_success "Temporary files automatically cleaned up"
+	fi
+
+	[[ "$import_success" == "true" ]] && touch "$BASE_DIR/.import_success"
+}
+
+# _monitor_import_progress - background progress reporter for parallel import phases.
+# Polls SUCCESS_LOG every 3 seconds and logs incremental progress.
+# Terminates when no parallel worker matching the given pattern is running.
+#
+# Args:
+#   $1 - total file count to import
+#   $2 - pattern to match against pgrep (e.g. "import_single_file" or "import_csv_file")
+_monitor_import_progress() {
+	local total="$1"
+	local worker_pattern="$2"
+	local start_time
+	start_time=$(date +%s)
+	local last_count=0
+	local last_log_time=$start_time
+
+	while true; do
+		if [[ -f "$SUCCESS_LOG" ]]; then
+			local completed
+			completed=$(wc -l < "$SUCCESS_LOG" 2>/dev/null || echo "0")
+			local current_time
+			current_time=$(date +%s)
+			local time_since_last_log=$(( current_time - last_log_time ))
+
+			if [[ $completed -gt $last_count && $completed -gt 0 ]]; then
+				local elapsed=$(( current_time - start_time ))
+				local minutes=$(( elapsed / 60 ))
+				local seconds=$(( elapsed % 60 ))
+				log_progress "Imported $completed/$total tables (${minutes}m ${seconds}s elapsed)"
+				last_count=$completed
+				last_log_time=$current_time
+			elif [[ $time_since_last_log -ge 10 && $completed -gt 0 ]]; then
+				local remaining=$(( total - completed ))
+				log_progress "Still working: $completed/$total complete, $remaining remaining"
+				last_log_time=$current_time
+			fi
+		fi
+		sleep 3
+
+		if ! pgrep -f "parallel.*${worker_pattern}" > /dev/null; then
+			break
+		fi
+	done
 }
 
 # Temporarily increase buffer pool (session only)
@@ -1602,10 +2494,6 @@ test_larger_buffer_pool() {
 	echo "2. Verify: mariadb -u test_user -ptest_password -e \"SELECT @@innodb_buffer_pool_size/1024/1024/1024 AS buffer_pool_GB;\""
 	echo "3. Test your import: ./rockdbutil.sh -i your_backup.tar.gz"
 	echo
-	echo -e "${GREEN}Expected improvement:${NC}"
-	echo "• DB_A: 14min → 7-10min"
-	echo "• DB_B: 28min → 14-20min"
-	echo
 	echo -e "${CYAN}If you want to revert:${NC}"
 	echo "sudo cp $backup_file $config_file && sudo systemctl restart mariadb"
 }
@@ -1680,18 +2568,6 @@ SET SESSION autocommit = 1;
 EOF
 	
 	log_success "Import completed in ${minutes}m ${seconds}s"
-	
-	echo -e "${CYAN}Performance comparison:${NC}"
-	echo "• Previous time: Your baseline (14min DB_A - 350mb, 28min DB_B - 700mb)"
-	echo "• This test: ${minutes}m ${seconds}s"
-	
-	if [[ $duration -lt 840 ]]; then  # 14min
-		echo -e "${GREEN}Significant improvement! Buffer pool optimization worked!${NC}"
-	elif [[ $duration -lt 1200 ]]; then  # 20min  
-		echo -e "${YELLOW}Good improvement! Some benefit from buffer pool${NC}"
-	else
-		echo -e "${RED}Limited improvement - may need additional optimizations${NC}"
-	fi
 }
 
 retry_failed_imports() {
@@ -1883,6 +2759,27 @@ selective_restore() {
 	IMPORT_TYPE=""
 	resolve_import_file "$archive_file"
 
+	if [[ "$IMPORT_TYPE" == "split_sql" ]]; then
+		log_step "Detected monolithic SQL dump (.sql.gz) - invoking sqlsplit for selective restore.."
+
+		if [[ ! -f "$SQLSPLIT_PATH" ]]; then
+			log_error "sqlsplit.sh not found at: $SQLSPLIT_PATH"
+			log_info "Place sqlsplit.sh in the same directory as rockdbutil.sh"
+			exit 1
+		fi
+
+		if [[ ! -x "$SQLSPLIT_PATH" ]]; then
+			log_error "sqlsplit.sh is not executable: $SQLSPLIT_PATH"
+			log_info "Run: chmod +x $SQLSPLIT_PATH"
+			exit 1
+		fi
+
+		local sqlsplit_csv_flag=""
+		[[ "$EXPORT_FORMAT" == "csv" ]] && sqlsplit_csv_flag="--csv"
+		bash "$SQLSPLIT_PATH" "$archive_file" --direct-to-dir "$EXTRACT_DIR" --db-name "$DB_NAME" --threshold "$LARGE_TABLE_THRESHOLD_MB" $sqlsplit_csv_flag
+		IMPORT_TYPE="split"
+	fi
+
 	if [[ "$IMPORT_TYPE" == "archive" ]]; then
 		log_step "Extracting archive: $archive_file"
 		if tar -xzf "$archive_file" -C "$EXTRACT_DIR" 2>/dev/null; then
@@ -1997,16 +2894,20 @@ selective_restore() {
 	local restore_set_lookup
 	restore_set_lookup=$(printf '\n%s' "${final_restore_tables[@]}")
 
-	while IFS= read -r sql_file; do
+	# Size estimation uses .csv files for CSV archives, .sql files for SQL archives
+	local size_ext=".sql"
+	[[ "$archive_export_format" == "csv" ]] && size_ext=".csv"
+
+	while IFS= read -r data_file; do
 		local file_bytes
-		file_bytes=$(stat -c%s "$sql_file" 2>/dev/null || echo 0)
+		file_bytes=$(stat -c%s "$data_file" 2>/dev/null || echo 0)
 		total_archive_bytes=$((total_archive_bytes + file_bytes))
 		local tname
-		tname=$(basename "$sql_file" .sql)
+		tname=$(basename "$data_file" "$size_ext")
 		if echo "$restore_set_lookup" | grep -qxF "$tname"; then
 			restore_archive_bytes=$((restore_archive_bytes + file_bytes))
 		fi
-	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql")
+	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*${size_ext}" ! -name "__*.sql")
 
 	# -- Move non-restore tables to __held/ --
 	local held_dir="$EXTRACT_DIR/__held"
@@ -2014,14 +2915,36 @@ selective_restore() {
 
 	local skipped_tables=()
 
-	while IFS= read -r sql_file; do
-		local tname
-		tname=$(basename "$sql_file" .sql)
-		if ! echo "$restore_set_lookup" | grep -qxF "$tname"; then
-			mv "$sql_file" "$held_dir/"
-			skipped_tables+=("$tname")
-		fi
-	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql")
+	if [[ "$archive_export_format" == "csv" ]]; then
+		# CSV archive: hold .csv files and matching .schema.sql files for non-restore tables
+		while IFS= read -r csv_file; do
+			local tname
+			tname=$(basename "$csv_file" .csv)
+			if ! echo "$restore_set_lookup" | grep -qxF "$tname"; then
+				mv "$csv_file" "$held_dir/"
+				[[ -f "$EXTRACT_DIR/${tname}.schema.sql" ]] && mv "$EXTRACT_DIR/${tname}.schema.sql" "$held_dir/"
+				skipped_tables+=("$tname")
+			fi
+		done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.csv")
+
+		# Also hold SQL fallback files (blob tables) that are not in restore set
+		while IFS= read -r sql_file; do
+			local tname
+			tname=$(basename "$sql_file" .sql)
+			if ! echo "$restore_set_lookup" | grep -qxF "$tname"; then
+				mv "$sql_file" "$held_dir/" 2>/dev/null || true
+			fi
+		done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "*.schema.sql" ! -name "__*.sql")
+	else
+		while IFS= read -r sql_file; do
+			local tname
+			tname=$(basename "$sql_file" .sql)
+			if ! echo "$restore_set_lookup" | grep -qxF "$tname"; then
+				mv "$sql_file" "$held_dir/"
+				skipped_tables+=("$tname")
+			fi
+		done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql")
+	fi
 
 	local restore_count=${#final_restore_tables[@]}
 	local skipped_count=${#skipped_tables[@]}
@@ -2032,16 +2955,42 @@ selective_restore() {
 	# The manifest is written by sqlsplit during .sql.gz splits but is never packed into
 	# .tar.gz archives - selective restore must rebuild it from file sizes so that
 	# import_single_file correctly defers large tables to chunk_import_file.
+	#
+	# For CSV archives, scan .csv file sizes instead of .sql file sizes.
+	local archive_export_format="sql"
+	local archive_csv_load_mode="server"
+	if [[ -f "$EXTRACT_DIR/__export_meta.txt" ]]; then
+		local meta_format
+		meta_format=$(grep "^export_format=" "$EXTRACT_DIR/__export_meta.txt" | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+		[[ "$meta_format" == "csv" ]] && archive_export_format="csv"
+
+		local meta_load_mode
+		meta_load_mode=$(grep "^csv_load_mode=" "$EXTRACT_DIR/__export_meta.txt" | cut -d'=' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+		[[ -n "$meta_load_mode" ]] && archive_csv_load_mode="$meta_load_mode"
+	fi
+
 	local manifest_file="$EXTRACT_DIR/__large_tables.txt"
 	rm -f "$manifest_file"
-	while IFS= read -r sql_file; do
-		local file_bytes
-		file_bytes=$(stat -c%s "$sql_file" 2>/dev/null || echo 0)
-		local file_mb=$(( file_bytes / 1048576 ))
-		if [[ $file_mb -ge $LARGE_TABLE_THRESHOLD_MB ]]; then
-			basename "$sql_file" .sql >> "$manifest_file"
-		fi
-	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql")
+
+	if [[ "$archive_export_format" == "csv" ]]; then
+		while IFS= read -r csv_file; do
+			local file_bytes
+			file_bytes=$(stat -c%s "$csv_file" 2>/dev/null || echo 0)
+			local file_mb=$(( file_bytes / 1048576 ))
+			if [[ $file_mb -ge $LARGE_TABLE_THRESHOLD_MB ]]; then
+				basename "$csv_file" .csv >> "$manifest_file"
+			fi
+		done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.csv")
+	else
+		while IFS= read -r sql_file; do
+			local file_bytes
+			file_bytes=$(stat -c%s "$sql_file" 2>/dev/null || echo 0)
+			local file_mb=$(( file_bytes / 1048576 ))
+			if [[ $file_mb -ge $LARGE_TABLE_THRESHOLD_MB ]]; then
+				basename "$sql_file" .sql >> "$manifest_file"
+			fi
+		done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql")
+	fi
 
 	if [[ -f "$manifest_file" ]]; then
 		local large_count
@@ -2049,7 +2998,7 @@ selective_restore() {
 		log_info "Large tables in restore set flagged for chunked import: $large_count (>${LARGE_TABLE_THRESHOLD_MB}MB)"
 	fi
 
-	# -- Run existing import pipeline --
+	# -- Run import pipeline --
 	log_step "Running import pipeline on selective restore set.."
 
 	local buffer_info
@@ -2058,8 +3007,6 @@ selective_restore() {
 	current_buffer_gb=$(echo "$buffer_info" | cut -d: -f1)
 	local suggested_buffer_gb
 	suggested_buffer_gb=$(echo "$buffer_info" | cut -d: -f2)
-	local total_ram_gb
-	total_ram_gb=$(echo "$buffer_info" | cut -d: -f3)
 
 	local use_buffer_optimization=false
 	local cleanup_buffer=false
@@ -2094,69 +3041,16 @@ selective_restore() {
 
 	register_worker_exports
 
-	local sequences_file="$EXTRACT_DIR/__sequences.sql"
-	if [[ -f "$sequences_file" && -s "$sequences_file" ]]; then
-		log_step "Importing sequences (pre-import step).."
-		if "$mysql_cmd" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$sequences_file" \
-			2>"$ERROR_LOG_DIR/__sequences.error"; then
-			log_success "Sequences imported"
-			rm -f "$ERROR_LOG_DIR/__sequences.error"
-		else
-			log_warning "Sequence import had errors (may be harmless if sequences already exist)"
-		fi
+	if [[ "$archive_export_format" == "csv" ]]; then
+		CSV_LOAD_MODE="$archive_csv_load_mode"
+		export CSV_LOAD_MODE
+		log_info "CSV archive detected (load_mode: $CSV_LOAD_MODE) - using three-phase selective restore"
+		_import_database_csv "$mysql_cmd" "$threads" "false" "$use_buffer_optimization"
+	else
+		_import_database_sql "$mysql_cmd" "$threads" "false" "$use_buffer_optimization"
 	fi
 
-	local total_files
-	total_files=$(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql" | wc -l)
-
-	local sql_file_list=()
-	while IFS= read -r -d '' f; do
-		sql_file_list+=("$f")
-	done < <(find "$EXTRACT_DIR" -maxdepth 1 -name "*.sql" ! -name "__*.sql" -print0)
-
-	parallel -j "$threads" import_single_file {} "$mysql_cmd" ::: "${sql_file_list[@]}" || true
-
-	local deferred_file="$EXTRACT_DIR/__deferred_large.txt"
-	if [[ -f "$deferred_file" && -s "$deferred_file" ]]; then
-		log_info "Pre-computing row counts for large tables.."
-		while IFS= read -r table_name; do
-			local sql_file="$EXTRACT_DIR/${table_name}.sql"
-			awk '/^\(/ { count++ } END { print count+0 }' "$sql_file" \
-				> "$EXTRACT_DIR/${table_name}.rowcount" &
-		done < "$deferred_file"
-		wait
-
-		log_step "Importing large tables (${MAX_CONCURRENT_LARGE_TABLES} concurrent, ${LARGE_TABLE_CHUNKS} streams each).."
-		local large_pids=()
-		local running=0
-
-		while IFS= read -r table_name; do
-			local sql_file="$EXTRACT_DIR/${table_name}.sql"
-			chunk_import_file "$sql_file" "$mysql_cmd" "$LARGE_TABLE_CHUNKS" &
-			large_pids+=($!)
-			running=$((running + 1))
-
-			if [[ $running -ge $MAX_CONCURRENT_LARGE_TABLES ]]; then
-				wait "${large_pids[0]}" || true
-				large_pids=("${large_pids[@]:1}")
-				running=$((running - 1))
-			fi
-		done < "$deferred_file"
-
-		local p
-		for p in "${large_pids[@]}"; do
-			wait "$p" || true
-		done
-	fi
-
-	if grep -q "^FAILED:" "$ERROR_REPORT" 2>/dev/null; then
-		log_warning "Some imports failed - retrying sequentially.."
-		retry_failed_imports "$mysql_cmd" || true
-	fi
-
-	if [[ "$use_buffer_optimization" == "true" ]]; then
-		restore_import_optimizations
-	fi
+	rm -f "$BASE_DIR/.import_success"
 
 	# -- Restore or discard held files --
 	if [[ "$auto_cleanup" == "true" ]]; then
@@ -2166,7 +3060,7 @@ selective_restore() {
 		rm -rf "$ERROR_LOG_DIR"/*
 		log_success "Held files discarded (--auto-cleanup)"
 	else
-		find "$held_dir" -maxdepth 1 -name "*.sql" -exec mv {} "$EXTRACT_DIR/" \;
+		find "$held_dir" -maxdepth 1 \( -name "*.sql" -o -name "*.csv" \) -exec mv {} "$EXTRACT_DIR/" \;
 		rmdir "$held_dir" 2>/dev/null || true
 		log_info "Held files restored to: $EXTRACT_DIR"
 	fi
@@ -2188,6 +3082,8 @@ binlog_position=${new_binlog_position}
 export_timestamp=$(date +"%Y-%m-%d %H:%M:%S")
 db_name=${DB_NAME}
 rockdbutil_version=1.0
+export_format=${archive_export_format}
+csv_load_mode=${archive_csv_load_mode}
 EOF
 		log_info "Binlog baseline advanced to: ${new_binlog_file}:${new_binlog_position}"
 	else
@@ -2232,7 +3128,7 @@ show_usage() {
 	echo -e "${WHITE}rockdbutil - MariaDB/MySQL Import/Export Tool${NC}"
 	echo -e "${WHITE}Usage:${NC}"
 	echo "  $0 --setup                              # Initial setup (creates config file and directories)"
-	echo "  $0 -e [-db profile] [-d]                # Export database"
+	echo "  $0 -e [-db profile] [-d] [--sql]        # Export database"
 	echo "  $0 -i <archive> [-db profile] [-d]      # Import database"
 	echo "                                          # Accepts .tar.gz (rockdbutil export)"
 	echo "                                          # or .sql.gz (monolithic mysqldump/mariadb-dump)"
@@ -2245,18 +3141,29 @@ show_usage() {
 	echo "  -d, --auto-cleanup                      # Automatic cleanup of temporary files"
 	echo "                                          # Also applies buffer pool optimization for imports"
 	echo "  -e, --export                            # Export database to compressed archive"
+	echo "                                          # Default format: CSV (faster at scale)"
+	echo "  --sql                                   # Force SQL export for this run (overrides config)"
+	echo "                                          # Use when CSV is not available or for legacy compat"
 	echo "  -i, --import FILE                       # Import database from compressed archive"
+	echo "                                          # Format auto-detected from archive metadata"
 	echo "  -h, --help                              # Show this help message"
+	echo
+	echo -e "${WHITE}Export formats:${NC}"
+	echo "  CSV (default)  - Schema as .schema.sql + data as .csv via SELECT INTO OUTFILE"
+	echo "                   5-10x faster than SQL at 70GB+ scale via LOAD DATA INFILE on import"
+	echo "                   Tables with blob/binary columns fall back to SQL automatically"
+	echo "  SQL (--sql)    - Full per-table .sql files via mysqldump (legacy behaviour)"
+	echo "                   Use if secure_file_priv=NULL and local_infile=OFF on the server"
 	echo
 	echo -e "${WHITE}Examples:${NC}"
 	echo "  $0 --setup                              # First time setup"
-	echo "  $0 -e                                   # Export using default database profile"
+	echo "  $0 -e                                   # Export as CSV (default - fastest)"
+	echo "  $0 -e --sql                             # Export as SQL (legacy format)"
 	echo "  $0 -e -db production                    # Export using 'production' database profile"
 	echo "  $0 -e -d                                # Export with automatic cleanup"
-	echo "  $0 -i backup.tar.gz                     # Import rockdbutil export to default database"
+	echo "  $0 -i backup.tar.gz                     # Import rockdbutil export (CSV or SQL, auto-detected)"
 	echo "  $0 -i db_backup.sql.gz                  # Import monolithic prod dump to default database"
 	echo "  $0 -i backup.tar.gz -db staging         # Import to 'staging' database profile"
-	echo "  $0 -i db_backup.sql.gz -db staging      # Import prod dump to 'staging' profile"
 	echo "  $0 -i backup.tar.gz -d                  # Import with auto-cleanup and optimization"
 	echo "  $0 -d -i backup.tar.gz -db production   # Auto-optimized import to production"
 	echo
@@ -2275,9 +3182,11 @@ show_usage() {
 	echo "  Base: ~/database_operations/ (configurable in config file)"
 	echo "  Dumps: ~/database_operations/dumps/"
 	echo "  Restore: ~/database_operations/restore/"
+	echo "  CSV staging: ~/database_operations/csv_export/"
 	echo "  Logs: ~/database_operations/logs/"
 	echo
 	echo -e "${WHITE}Performance Features:${NC}"
+	echo "  • CSV export/import via SELECT INTO OUTFILE + LOAD DATA INFILE (default)"
 	echo "  • Parallel processing (auto-detects CPU cores)"
 	echo "  • Automatic buffer pool optimization for imports"
 	echo "  • Intelligent retry logic for failed imports"
@@ -2295,7 +3204,8 @@ main() {
 	local command=""
 	local archive_file=""
 	local selective_tables=""
-	
+	local force_sql_export=false
+
 	while [[ $# -gt 0 ]]; do
 		case $1 in
 			-d|--auto-cleanup)
@@ -2314,6 +3224,10 @@ main() {
 				archive_file="$2"
 				[[ "$command" != "selective-restore" ]] && command="import"
 				shift 2
+				;;
+			--sql)
+				force_sql_export=true
+				shift
 				;;
 			--setup|setup)
 				command="setup"
@@ -2359,17 +3273,23 @@ main() {
 				;;
 		esac
 	done
-	
+
 	if [[ "$command" == "setup" ]]; then
 		setup_rockdbutil
 		return
 	fi
-	
+
 	if [[ "$command" != "help" && "$command" != "list-profiles" ]]; then
 		load_database_config "$database_profile"
-		
+
 		if [[ "$auto_cleanup" == "false" && "$AUTO_CLEANUP_CONFIG" == "true" ]]; then
 			auto_cleanup=true
+		fi
+
+		# --sql flag overrides config export_format for this run only
+		if [[ "$force_sql_export" == "true" ]]; then
+			EXPORT_FORMAT="sql"
+			log_info "SQL export mode forced via --sql flag"
 		fi
 	fi
 	

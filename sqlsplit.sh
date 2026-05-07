@@ -38,6 +38,21 @@ log_error()    { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()     { echo -e "${PURPLE}[STEP]${NC} $1"; }
 log_progress() { echo -e "${CYAN}[PROGRESS]${NC} $1"; }
 
+format_duration() {
+	local total_seconds="$1"
+	local minutes=$(( total_seconds / 60 ))
+	local seconds=$(( total_seconds % 60 ))
+	printf "%dm %ds" "$minutes" "$seconds"
+}
+
+log_timed_success() {
+	local label="$1"
+	local start_ts="$2"
+	local end_ts
+	end_ts=$(date +%s)
+	log_success "$label ($(format_duration $(( end_ts - start_ts ))))"
+}
+
 # === DEFAULTS ===
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 BASE_WORK_DIR="${TMPDIR:-/tmp}/sqlsplit_$$"
@@ -46,6 +61,7 @@ DIRECT_TO_DIR=""
 AUTO_CLEANUP=false
 DB_NAME_OVERRIDE=""
 LARGE_TABLE_THRESHOLD_MB=300
+CSV_MODE=false
 
 # === USAGE ===
 show_usage() {
@@ -60,6 +76,8 @@ show_usage() {
 	echo "                        Used internally by rockdbutil - skips the archive step entirely"
 	echo "  --db-name NAME        Override database name (skips detection from dump header)"
 	echo "                        Passed automatically by rockdbutil from the loaded profile"
+	echo "  --csv                 Emit tablename.schema.sql + tablename.csv instead of tablename.sql"
+	echo "                        Used internally by rockdbutil when export_format=csv (default)"
 	echo "  --cleanup             Remove temporary working files after completion"
 	echo "  -h, --help            Show this help"
 	echo
@@ -178,6 +196,8 @@ split_sql_by_table() {
 	local preamble_file="$3"
 	local count_file="$4"
 	local threshold_mb="${5:-300}"
+	local split_start
+	split_start=$(date +%s)
 
 	log_step "Streaming and splitting SQL dump.."
 
@@ -267,7 +287,251 @@ split_sql_by_table() {
 			}
 		}
 	' || true
+
+	log_timed_success "SQL split stream complete" "$split_start"
 }
+
+
+# === CSV SPLIT LOGIC ===
+# Streams zcat output through awk - same single-pass approach as split_sql_by_table.
+#
+# For each table, emits two files:
+#   tablename.schema.sql  - DDL only (CREATE TABLE, indexes, constraints)
+#   tablename.csv         - tab-separated data rows, \N for NULLs
+#
+# The awk state machine tracks:
+#   in_schema  - inside the CREATE TABLE / DDL block, write to schema file
+#   in_data    - inside the INSERT data block, convert rows to TSV
+#
+# INSERT row conversion:
+#   mysqldump emits:  INSERT INTO `tbl` VALUES (v1,v2,...),(v1,v2,...);
+#   Each value row starts with ( at column 1 in extended-insert format.
+#   The parser strips the outer parens, then walks character-by-character
+#   through the value list maintaining a quoted-string state to correctly
+#   split on commas that are field separators (not commas inside strings).
+#
+#   Value transformations:
+#     NULL            -> \N      (LOAD DATA INFILE native NULL marker)
+#     'string'        -> string  (strip surrounding single quotes)
+#     \'              -> '       (unescape escaped single quote inside strings)
+#     \\              -> \       (unescape escaped backslash)
+#     numbers/dates   -> as-is   (no quotes in mysqldump output)
+#
+# Args:
+#   $1 - input .sql.gz file
+#   $2 - tables output directory
+#   $3 - preamble file path
+#   $4 - count file path
+#   $5 - large table threshold MB
+split_sql_by_table_csv() {
+	local gz_file="$1"
+	local tables_dir="$2"
+	local preamble_file="$3"
+	local count_file="$4"
+	local threshold_mb="${5:-300}"
+	local csv_split_start
+	csv_split_start=$(date +%s)
+
+	log_step "Streaming and splitting SQL dump (CSV mode, single pass).."
+
+	# Same SIGPIPE caveat as split_sql_by_table(): awk may exit before zcat finishes.
+	zcat "$gz_file" 2>/dev/null \
+	| awk -v tables_dir="$tables_dir" -v preamble="$preamble_file" -v count_file="$count_file" \
+	      -v threshold_bytes="$((threshold_mb * 1024 * 1024))" '
+		function write_schema(line) {
+			print line >> current_schema
+			schema_bytes += length(line) + 1
+		}
+
+		function note_large_table() {
+			if (current_table != "" && csv_bytes >= threshold_bytes) {
+				large_tables = large_tables current_table "\n"
+			}
+		}
+
+		function open_table_files(name,    line) {
+			if (current_schema != "") {
+				note_large_table()
+				close(current_schema)
+				close(current_csv)
+			}
+
+			current_table = name
+			current_schema = tables_dir "/" name ".schema.sql"
+			current_csv = tables_dir "/" name ".csv"
+			schema_bytes = 0
+			csv_bytes = 0
+			in_data = 0
+
+			while ((getline line < preamble) > 0) {
+				write_schema(line)
+			}
+			close(preamble)
+
+			print "" > current_csv
+			close(current_csv)
+
+			write_schema("-- sqlsplit: table " name)
+			write_schema("SET foreign_key_checks = 0;")
+			write_schema("SET unique_checks = 0;")
+			write_schema("SET autocommit = 0;")
+			write_schema("START TRANSACTION;")
+			table_count++
+		}
+
+		function emit_field(raw,    value) {
+			value = raw
+			if (value == "NULL") {
+				fields[++field_count] = "\\N"
+				return
+			}
+
+			if (value ~ /^'\''/ && value ~ /'\''$/) {
+				value = substr(value, 2, length(value) - 2)
+				gsub(/\\'\''/, "'\''", value)
+				gsub(/\\\\/, "\\", value)
+			}
+
+			fields[++field_count] = value
+		}
+
+		function flush_row(    i, output) {
+			output = ""
+			for (i = 1; i <= field_count; i++) {
+				if (i > 1) output = output OFS
+				output = output fields[i]
+			}
+			print output >> current_csv
+			csv_bytes += length(output) + 1
+			delete fields
+			field_count = 0
+		}
+
+		function write_csv_row(line,    i, ch, field, in_string, escape) {
+			sub(/^\(/, "", line)
+			sub(/\)[,;[:space:]]*$/, "", line)
+
+			field = ""
+			in_string = 0
+			escape = 0
+			field_count = 0
+
+			for (i = 1; i <= length(line); i++) {
+				ch = substr(line, i, 1)
+
+				if (escape) {
+					field = field "\\" ch
+					escape = 0
+					continue
+				}
+
+				if (in_string && ch == "\\") {
+					field = field ch
+					escape = 1
+					continue
+				}
+
+				if (ch == "'\''") {
+					field = field ch
+					in_string = !in_string
+					continue
+				}
+
+				if (!in_string && ch == ",") {
+					emit_field(field)
+					field = ""
+					continue
+				}
+
+				field = field ch
+			}
+
+			emit_field(field)
+			flush_row()
+		}
+
+		BEGIN {
+			OFS = "\t"
+			current_table = ""
+			current_schema = ""
+			current_csv = ""
+			schema_bytes = 0
+			csv_bytes = 0
+			table_count = 0
+			large_tables = ""
+			in_data = 0
+		}
+
+		/^-- Table structure for table `/ {
+			line = $0
+			gsub(/^[^`]*`/, "", line)
+			gsub(/`.*$/, "", line)
+			if (line != "") {
+				open_table_files(line)
+				write_schema($0)
+			}
+			next
+		}
+
+		/^-- Dumping data for table `/ {
+			in_data = 1
+			next
+		}
+
+		/^-- Dump completed/ { next }
+
+		/^LOCK TABLES / {
+			if (in_data) next
+		}
+
+		/^UNLOCK TABLES;/ {
+			if (in_data) next
+		}
+
+		/^INSERT INTO/ {
+			if (in_data) next
+		}
+
+		/^\(/ {
+			if (in_data && current_csv != "") {
+				write_csv_row($0)
+				next
+			}
+		}
+
+		{
+			if (current_schema != "" && !in_data) {
+				write_schema($0)
+			}
+		}
+
+		END {
+			if (current_schema != "") {
+				note_large_table()
+				close(current_schema)
+				close(current_csv)
+			}
+			print table_count > count_file
+			if (large_tables != "") {
+				manifest = tables_dir "/__large_tables.txt"
+				printf "%s", large_tables > manifest
+				close(manifest)
+			}
+		}
+	' || true
+
+	local table_count=0
+	[[ -f "$count_file" ]] && table_count=$(cat "$count_file")
+	if [[ -z "$table_count" || "$table_count" -eq 0 ]]; then
+		return
+	fi
+
+	local csv_count schema_count
+	csv_count=$(find "$tables_dir" -maxdepth 1 -name "*.csv" | wc -l)
+	schema_count=$(find "$tables_dir" -maxdepth 1 -name "*.schema.sql" | wc -l)
+	log_timed_success "Conversion complete: ${schema_count} schema files, ${csv_count} CSV files" "$csv_split_start"
+}
+
 
 # === CLEANUP ===
 cleanup_work_dir() {
@@ -304,6 +568,10 @@ main() {
 			--threshold)
 				LARGE_TABLE_THRESHOLD_MB="$2"
 				shift 2
+				;;
+			--csv)
+				CSV_MODE=true
+				shift
 				;;
 			--cleanup)
 				AUTO_CLEANUP=true
@@ -390,7 +658,11 @@ main() {
 
 	# table_count is written to count_file by awk - avoids $() subshell which
 	# would cause the EXIT trap to fire mid-split and wipe BASE_WORK_DIR.
-	split_sql_by_table "$input_file" "$tables_dir" "$preamble_file" "$count_file" "$LARGE_TABLE_THRESHOLD_MB"
+	if [[ "$CSV_MODE" == "true" ]]; then
+		split_sql_by_table_csv "$input_file" "$tables_dir" "$preamble_file" "$count_file" "$LARGE_TABLE_THRESHOLD_MB"
+	else
+		split_sql_by_table "$input_file" "$tables_dir" "$preamble_file" "$count_file" "$LARGE_TABLE_THRESHOLD_MB"
+	fi
 
 	local table_count=0
 	if [[ -f "$count_file" ]]; then
@@ -404,7 +676,11 @@ main() {
 		exit 1
 	fi
 
-	log_success "Split complete: ${table_count} tables"
+	if [[ "$CSV_MODE" == "true" ]]; then
+		log_success "Split complete: ${table_count} tables (CSV mode)"
+	else
+		log_success "Split complete: ${table_count} tables"
+	fi
 
 	local manifest="$tables_dir/__large_tables.txt"
 	if [[ -f "$manifest" ]]; then
@@ -415,6 +691,17 @@ main() {
 
 	# --direct-to-dir: files are already in place - rockdbutil handles the import.
 	if [[ -n "$DIRECT_TO_DIR" ]]; then
+		if [[ "$CSV_MODE" == "true" ]]; then
+			# Write a synthetic export meta so rockdbutil routes to the CSV import path.
+			# csv_load_mode=local because the client wrote the files, not the server.
+			cat > "$tables_dir/__export_meta.txt" <<METAEOF
+export_format=csv
+csv_load_mode=local
+db_name=${db_name}
+rockdbutil_version=1.0
+METAEOF
+			log_info "CSV meta written to: $tables_dir/__export_meta.txt"
+		fi
 		log_info "Files written directly to: $DIRECT_TO_DIR"
 		cleanup_work_dir
 		return 0
@@ -429,17 +716,34 @@ main() {
 	local archive_name="db_dump_${db_name}_${TIMESTAMP}.tar.gz"
 	local archive_path="${OUTPUT_DIR}/${archive_name}"
 
-	log_step "Packaging per-table SQL files into archive.."
+	if [[ "$CSV_MODE" == "true" ]]; then
+		log_step "Packaging per-table schema and CSV files into archive.."
+		local schema_count csv_count
+		schema_count=$(find "$tables_dir" -maxdepth 1 -name "*.schema.sql" | wc -l)
+		csv_count=$(find "$tables_dir" -maxdepth 1 -name "*.csv" | wc -l)
 
-	local file_count
-	file_count=$(find "$tables_dir" -maxdepth 1 -name "*.sql" | wc -l)
-	log_info "Packing ${file_count} table files"
+		# Write export meta into the standalone archive too
+		cat > "$tables_dir/__export_meta.txt" <<METAEOF
+export_format=csv
+csv_load_mode=local
+db_name=${db_name}
+rockdbutil_version=1.0
+METAEOF
 
-	tar -czf "$archive_path" -C "$tables_dir" .
-
-	local archive_size_mb
-	archive_size_mb=$(( $(stat -c%s "$archive_path" 2>/dev/null || stat -f%z "$archive_path") / 1024 / 1024 ))
-	log_success "Archive created: $archive_name (${archive_size_mb}MB, ${file_count} tables)"
+		tar -czf "$archive_path" -C "$tables_dir" .
+		local archive_size_mb
+		archive_size_mb=$(( $(stat -c%s "$archive_path" 2>/dev/null || stat -f%z "$archive_path") / 1024 / 1024 ))
+		log_success "Archive created: $archive_name (${archive_size_mb}MB, ${schema_count} schemas + ${csv_count} CSV files)"
+	else
+		log_step "Packaging per-table SQL files into archive.."
+		local file_count
+		file_count=$(find "$tables_dir" -maxdepth 1 -name "*.sql" | wc -l)
+		log_info "Packing ${file_count} table files"
+		tar -czf "$archive_path" -C "$tables_dir" .
+		local archive_size_mb
+		archive_size_mb=$(( $(stat -c%s "$archive_path" 2>/dev/null || stat -f%z "$archive_path") / 1024 / 1024 ))
+		log_success "Archive created: $archive_name (${archive_size_mb}MB, ${file_count} tables)"
+	fi
 
 	cleanup_work_dir
 
